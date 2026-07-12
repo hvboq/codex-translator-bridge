@@ -112,8 +112,9 @@ export function createHttpServer(
 
     if (method === 'POST' && pathname === '/v1/chat/completions') {
       const body = await readObject(request, config.bodyLimitBytes);
-      validateChatRequest(body);
+      const advisoryParameters = validateChatRequest(body);
       const prepared = await generations.prepareChat(body.messages, body.model);
+      setAdvisoryParametersHeader(response, advisoryParameters);
       if (body.stream === true) {
         await streamChatCompletion(request, response, generations, prepared, body);
       } else {
@@ -126,12 +127,13 @@ export function createHttpServer(
 
     if (method === 'POST' && pathname === '/v1/responses') {
       const body = await readObject(request, config.bodyLimitBytes);
-      validateResponsesRequest(body);
+      const advisoryParameters = validateResponsesRequest(body);
       const prepared = await generations.prepareResponse(
         body.input,
         body.instructions,
         body.model,
       );
+      setAdvisoryParametersHeader(response, advisoryParameters);
       if (body.stream === true) {
         await streamResponse(request, response, generations, prepared, body);
       } else {
@@ -191,8 +193,14 @@ async function readJson<T>(request: IncomingMessage, limit: number): Promise<T> 
   }
 }
 
-function validateChatRequest(body: JsonObject): void {
+function validateChatRequest(body: JsonObject): string[] {
   validateStream(body.stream);
+  const advisoryParameters = validateAdvisoryParameters(body, [
+    ['max_tokens', 'positiveInteger'],
+    ['max_completion_tokens', 'positiveInteger'],
+    ['temperature', 'temperature'],
+    ['top_p', 'probability'],
+  ]);
   if (body.n !== undefined && body.n !== 1) {
     throw new InputError('Only n=1 is supported');
   }
@@ -206,10 +214,6 @@ function validateChatRequest(body: JsonObject): void {
     'functions',
     'function_call',
     'audio',
-    'max_tokens',
-    'max_completion_tokens',
-    'temperature',
-    'top_p',
     'stop',
     'presence_penalty',
     'frequency_penalty',
@@ -259,10 +263,14 @@ function validateChatRequest(body: JsonObject): void {
       throw new InputError('Only text response_format is supported');
     }
   }
+  return advisoryParameters;
 }
 
-function validateResponsesRequest(body: JsonObject): void {
+function validateResponsesRequest(body: JsonObject): string[] {
   validateStream(body.stream);
+  const advisoryParameters = validateAdvisoryParameters(body, [
+    ['max_output_tokens', 'positiveInteger'],
+  ]);
   if (!Object.hasOwn(body, 'input')) {
     throw new InputError('input is required');
   }
@@ -288,7 +296,6 @@ function validateResponsesRequest(body: JsonObject): void {
     'previous_response_id',
     'conversation',
     'prompt',
-    'max_output_tokens',
     'max_tool_calls',
     'temperature',
     'top_p',
@@ -312,6 +319,7 @@ function validateResponsesRequest(body: JsonObject): void {
       }
     }
   }
+  return advisoryParameters;
 }
 
 function validateStream(value: unknown): void {
@@ -324,6 +332,45 @@ function rejectPresent(body: JsonObject, fields: string[]): void {
   const field = fields.find((name) => body[name] !== undefined && body[name] !== null);
   if (field) {
     throw new InputError(field + ' is not supported');
+  }
+}
+
+type AdvisoryParameterKind = 'positiveInteger' | 'temperature' | 'probability';
+
+function validateAdvisoryParameters(
+  body: JsonObject,
+  specifications: Array<readonly [string, AdvisoryParameterKind]>,
+): string[] {
+  const present: string[] = [];
+  for (const [field, kind] of specifications) {
+    const value = body[field];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (kind === 'positiveInteger') {
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+        throw new InputError(field + ' must be a positive integer or null');
+      }
+    } else if (
+      typeof value !== 'number' ||
+      !Number.isFinite(value) ||
+      (kind === 'temperature' ? value < 0 || value > 2 : value < 0 || value > 1)
+    ) {
+      throw new InputError(
+        field +
+          (kind === 'temperature'
+            ? ' must be between 0 and 2 or null'
+            : ' must be between 0 and 1 or null'),
+      );
+    }
+    present.push(field);
+  }
+  return present;
+}
+
+function setAdvisoryParametersHeader(response: ServerResponse, fields: string[]): void {
+  if (fields.length > 0) {
+    response.setHeader('X-Codex-Bridge-Advisory-Parameters', fields.join(', '));
   }
 }
 

@@ -240,10 +240,17 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
       stream: true,
       stream_options: { include_usage: true },
       model: 'gpt-5.6-terra',
+      max_tokens: 1024,
+      temperature: 0,
+      top_p: 0.3,
       messages: [{ role: 'user', content: 'Hello' }],
     }),
   });
   assert.match(chat.headers.get('content-type') ?? '', /text\/event-stream/);
+  assert.equal(
+    chat.headers.get('x-codex-bridge-advisory-parameters'),
+    'max_tokens, temperature, top_p',
+  );
   const chatFrames = parseDataFrames(await chat.text());
   assert.equal(chatFrames.at(-1), '[DONE]');
   const chatChunks = chatFrames.slice(0, -1).map((frame) => JSON.parse(frame));
@@ -291,6 +298,45 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
   assert.ok(!responseEvents.some((entry) => JSON.stringify(entry.data).includes('[DONE]')));
 });
 
+test('accepts validated max token aliases used by OpenAI-compatible clients', async (context) => {
+  const { base } = await startFixture(context);
+
+  const chat = await authorizedFetch(base + '/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      max_completion_tokens: 2048,
+      messages: [{ role: 'user', content: 'Hello' }],
+    }),
+  });
+  assert.equal(chat.status, 200);
+  assert.equal(
+    chat.headers.get('x-codex-bridge-advisory-parameters'),
+    'max_completion_tokens',
+  );
+
+  const response = await authorizedFetch(base + '/v1/responses', {
+    method: 'POST',
+    body: JSON.stringify({ max_output_tokens: 512, input: 'Hello' }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(
+    response.headers.get('x-codex-bridge-advisory-parameters'),
+    'max_output_tokens',
+  );
+
+  const unspecified = await authorizedFetch(base + '/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      max_tokens: null,
+      temperature: null,
+      top_p: null,
+      messages: [{ role: 'user', content: 'Hello' }],
+    }),
+  });
+  assert.equal(unspecified.status, 200);
+  assert.equal(unspecified.headers.get('x-codex-bridge-advisory-parameters'), null);
+});
+
 test('rejects unsupported multimodal, tool, stateful, and invalid model requests', async (context) => {
   const { base } = await startFixture(context);
   const cases: Array<{ path: string; body: unknown }> = [
@@ -300,7 +346,22 @@ test('rejects unsupported multimodal, tool, stateful, and invalid model requests
     },
     {
       path: '/v1/chat/completions',
-      body: { messages: [{ role: 'user', content: 'Hi' }], temperature: 0.5 },
+      body: { messages: [{ role: 'user', content: 'Hi' }], max_tokens: 0 },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: {
+        messages: [{ role: 'user', content: 'Hi' }],
+        max_completion_tokens: 1.5,
+      },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { messages: [{ role: 'user', content: 'Hi' }], temperature: 2.1 },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { messages: [{ role: 'user', content: 'Hi' }], top_p: '0.3' },
     },
     {
       path: '/v1/chat/completions',
@@ -312,7 +373,7 @@ test('rejects unsupported multimodal, tool, stateful, and invalid model requests
     },
     { path: '/v1/chat/completions', body: { model: 'gpt-5.5-codex', messages: [] } },
     { path: '/v1/responses', body: { input: 'Hi', store: true } },
-    { path: '/v1/responses', body: { input: 'Hi', max_output_tokens: 100 } },
+    { path: '/v1/responses', body: { input: 'Hi', max_output_tokens: -1 } },
     { path: '/v1/responses', body: { input: 'Hi', previous_response_id: 'resp_old' } },
     {
       path: '/v1/responses',
