@@ -13,7 +13,9 @@ export async function loadLocalAuth(tokenFile: string, noAuth: boolean): Promise
     return { token: null, tokenFile, created: false };
   }
 
-  const fromEnvironment = process.env.CODEX_TRANSLATOR_TOKEN?.trim();
+  const fromEnvironment = (
+    process.env.CODEX_BRIDGE_TOKEN ?? process.env.CODEX_TRANSLATOR_TOKEN
+  )?.trim();
   if (fromEnvironment) {
     return { token: fromEnvironment, tokenFile, created: false };
   }

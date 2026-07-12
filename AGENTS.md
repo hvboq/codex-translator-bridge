@@ -2,36 +2,38 @@
 
 ## Project
 
-Codex Translator Bridge is a Windows-first localhost translation service. It exposes dedicated and OpenAI-compatible HTTP endpoints, then runs translations through the official @openai/codex App Server using the user's existing Codex/ChatGPT login.
+Codex Bridge is a Windows-first localhost OpenAI-compatible text gateway. It uses the official `@openai/codex` App Server and the user's own Codex/ChatGPT login. General text generation is the primary surface; translation is an optional specialized route.
 
-This is not an offline model, a public API gateway, or a multi-user subscription proxy.
+This is not an offline model, a full OpenAI API implementation, a public gateway, or a multi-user subscription proxy.
 
 ## Architecture
 
-Request flow:
-
-    LunaTranslator/client -> HTTP server -> translation service -> Codex App Server -> ephemeral Codex thread
+```text
+OpenAI-compatible client -> HTTP server -> generation service -> Codex App Server
+Translation client       -> HTTP server -> translation service -> Codex App Server
+```
 
 Key files:
 
-- src/main.ts: application composition, startup, and shutdown.
-- src/config.ts: environment parsing, limits, paths, and loopback enforcement.
-- src/auth.ts: local bearer-token creation and constant-time validation.
-- src/http-server.ts: /translate, /v1/chat/completions, /v1/models, /v1/models/:id, and health routes.
-- src/translation-service.ts: validation, micro-batching, in-flight deduplication, caching, and retry.
-- src/app-server-client.ts: long-lived stdio JSON-RPC App Server process and ephemeral translation threads.
-- src/prompt.ts: translation-only instructions and structured-output schemas.
-- src/placeholders.ts: game token, markup, and control-code protection.
-- src/cache.ts: bounded in-memory cache plus optional JSONL persistence.
-- packaging/windows/: non-developer-facing Windows portable launchers and first-run guide.
-- scripts/build-release.ps1: reproducible Windows x64 ZIP builder with Node checksum verification.
-- test/: offline unit and HTTP tests using fake structured runners.
+- `src/main.ts`: composition, startup, and shutdown.
+- `src/config.ts`: canonical `CODEX_BRIDGE_*` configuration plus v0.1 fallback names.
+- `src/auth.ts`: local bearer-token creation and constant-time validation.
+- `src/http-server.ts`: models, Chat Completions, Responses, translation, health, and SSE mapping.
+- `src/generation-service.ts`: text-only Chat/Responses normalization, sanitized history injection, concurrency bounds, and general execution.
+- `src/translation-service.ts`: translation validation, micro-batching, cache, placeholder restoration, and retry.
+- `src/app-server-client.ts`: long-lived stdio JSON-RPC process, model catalog, ephemeral threads, live final-answer deltas, cancellation, and security policy.
+- `src/prompt.ts`: strictly separated general and translation instruction profiles.
+- `src/placeholders.ts`: game token, markup, and control-code protection for `/translate`.
+- `src/cache.ts`: bounded translation cache plus optional JSONL persistence.
+- `packaging/windows/`: non-developer Windows portable launchers and guide.
+- `scripts/build-release.ps1`: reproducible Windows x64 ZIP builder with Node checksum verification.
+- `test/`: offline service and HTTP/SSE tests using fake runners.
 
 ## Standard commands
 
 Use Windows-native command shims in PowerShell:
 
-~~~powershell
+```powershell
 npm.cmd ci
 npm.cmd run codex:status
 npm.cmd run codex:login
@@ -39,70 +41,74 @@ npm.cmd run typecheck
 npm.cmd test
 npm.cmd run build
 npm.cmd run release:windows
-~~~
+```
 
-Development and manual verification:
+Manual verification:
 
-~~~powershell
+```powershell
 npm.cmd run dev
 .\start.cmd
 .\scripts\test-request.ps1
-~~~
+```
 
-scripts/test-request.ps1 requires a running bridge. No lint or formatter command is currently configured.
+## API invariants
+
+- `GET /v1/models` exposes only account-visible `gpt-5.6-*` models.
+- Keep public model `id` separate from runtime `model`; return the ID over HTTP and pass its paired runtime value to Codex.
+- `codex-bridge` is the canonical unlisted default alias. Keep `codex-translator` as a v0.1 compatibility alias.
+- Chat and Responses are text-only compatibility subsets. Reject unsupported image, audio, file, tool, function, stateful, background, or stored-response behavior instead of silently ignoring it.
+- Chat streaming uses incremental `chat.completion.chunk` frames and `[DONE]`.
+- Responses streaming uses typed events ending in `response.completed`, without `[DONE]`.
+- Stream only `agentMessage` items whose phase is `final_answer`; never expose commentary, reasoning, plans, or tool events.
+- Validate and resolve requests before sending SSE headers.
+- General Chat/Responses generations are not persistently cached or micro-batched.
+- `/translate` retains model-separated micro-batching, in-flight deduplication, persistent cache, structured output, and placeholder protection.
 
 ## Coding and tests
 
-- Keep TypeScript strict and compatible with Node.js 18 or newer.
-- This is an ESM/NodeNext project. Local TypeScript imports must use .js specifiers.
-- Preserve noUncheckedIndexedAccess; narrow optional array and object values explicitly.
-- Keep HTTP validation at the boundary and use InputError for client errors.
-- Preserve public JSON field names and OpenAI-compatible response shapes.
-- Expose only account-visible `gpt-5.6-*` entries from the App Server model catalog. Keep `codex-translator` as an unlisted default alias.
-- Preserve the App Server distinction between public model `id` and runtime `model`: echo the resolved ID in HTTP responses, but pass its paired runtime model to `thread/start.model`.
-- Resolve aliases before cache or batching decisions. Include the paired runtime model in cache, in-flight deduplication, and batch grouping identities; never re-resolve a runtime model as if it were a public ID.
-- Validate CODEX_TRANSLATOR_REASONING_EFFORT against the selected catalog entry when supported efforts are available.
-- Inject StructuredRunner fakes in tests; unit tests must not require a Codex login or network access.
-- Add tests for changes to routes, authentication, model discovery or selection, batching, cache behavior, input limits, or placeholders.
-- Avoid adding dependencies when the Node.js standard library is sufficient.
-- If prompts, normalization, or translation semantics change, bump translation-v1 or chat-v1 in the cache identity.
+- Keep TypeScript strict, ESM/NodeNext, Node.js 18+, `.js` local import specifiers, and `noUncheckedIndexedAccess`.
+- Keep HTTP validation at the boundary and use `InputError` for client errors.
+- Reconstruct sanitized App Server history items; never forward arbitrary client-supplied Responses items.
+- Inject `StructuredRunner` fakes in unit tests; offline tests must not require login or network.
+- Add exact SSE event-order tests for streaming changes.
+- Preserve concurrency and queue bounds, cancellation, timeouts, and `thread/unsubscribe` cleanup.
+- Avoid dependencies when the Node.js standard library is sufficient.
+- If translation prompts or semantics change, bump the `translation-v2` cache identity.
 
 ## Security invariants
 
-Do not weaken these without an explicit security review:
+Do not weaken these without explicit security review:
 
-- Keep the HTTP server loopback-only. Never allow 0.0.0.0 or a LAN/public bind.
-- Keep bearer authentication enabled by default. CODEX_TRANSLATOR_NO_AUTH is only a local compatibility escape hatch.
-- Never log, expose, or commit bearer tokens, Codex credentials, source text, or cached translations.
-- Treat source text, context, glossary values, and chat messages as untrusted inert data.
-- Keep translation threads ephemeral, non-interactive, read-only, and without network access.
-- Keep shell, MCP, plugins, apps, browser/computer use, memories, multi-agent features, hooks, and approval requests disabled or declined.
-- Preserve structured-output schemas and placeholder validation.
-- Preserve request-size, character, batch, queue, and timeout bounds.
-- Require bearer authentication for new operational endpoints unless they intentionally expose only non-sensitive loopback health metadata.
-- Keep model catalog and model-detail routes authenticated. Do not expose hidden, unavailable, or non-GPT-5.6 App Server models.
-- Never expose or copy Codex authentication files through the HTTP API.
+- HTTP remains loopback-only; never allow `0.0.0.0`, LAN, or public binds.
+- Bearer authentication remains enabled by default. `CODEX_BRIDGE_NO_AUTH` is a local compatibility escape hatch only.
+- Never log, expose, or commit bearer tokens, Codex credentials, request text, or cached translations.
+- All threads remain ephemeral, non-interactive, read-only, network-disabled, and `approvalPolicy: never`.
+- Shell, MCP, plugins, apps, browser/computer use, memories, multi-agent, hooks, and approval paths remain disabled or declined.
+- Ignore request-controlled `cwd`, tools, permissions, and local paths.
+- Require bearer authentication for model and operational endpoints except the intentionally minimal root and health routes.
+- Never expose or copy Codex authentication files through HTTP or release assets.
+
+## Configuration compatibility
+
+Canonical names use `CODEX_BRIDGE_*`. v0.1 `CODEX_TRANSLATOR_*` names remain lower-priority fallbacks for one-step migration. When both are set, the canonical name wins. New documentation and examples must use only canonical names except migration notes and compatibility tests.
 
 ## Runtime data
 
-Runtime files live under ignored data/:
+Ignored runtime files:
 
-- data/token.txt: generated local bearer token.
-- data/translations.jsonl: plaintext persistent translation cache.
-- data/runtime/: dedicated empty Codex working directory.
+- `data/token.txt`: local bearer token.
+- `data/translations.jsonl`: plaintext `/translate` cache.
+- `data/runtime/`: empty Codex working directory.
+- `config.ps1`: optional local configuration and secrets.
 
-Persistent caching is enabled by default and can be disabled with CODEX_TRANSLATOR_PERSIST_CACHE=false. Cache files may contain private game or subtitle text.
+General Chat/Responses content must not be written to `translations.jsonl`.
 
-The App Server process is long-lived, but every translation batch uses a new ephemeral thread. The SSE endpoint is compatibility streaming: it emits one completed content chunk, a stop chunk, and [DONE]; it is not token-by-token streaming.
+## Changes and releases
 
-## Changes and commits
-
-- Never commit data/, config.ps1, .env, dist/, node_modules/, logs, or temporary files.
-- Keep package-lock.json synchronized with dependency changes.
-- Keep @openai/codex pinned to an exact version unless an upgrade is deliberately tested.
-- Update README.md and config.example.ps1 when endpoints, setup, defaults, or environment variables change.
-- Keep repository-authored code and documentation under the root MIT License. Do not vendor third-party code without preserving its original license and documenting it in THIRD_PARTY_NOTICES.md.
-- Portable releases must contain no credentials or cache data, must verify the downloaded Node.js archive checksum, and must include third-party license texts.
-- Keep commits focused and use clear imperative subjects.
-- Before committing, run npm.cmd run check and git diff --check.
-- For App Server, authentication, or startup changes, also run a live health/translation smoke test when credentials and network are available.
+- Never commit `data/`, `config.ps1`, `.env`, `dist/`, `node_modules/`, logs, or temp files.
+- Keep `package-lock.json` synchronized and `@openai/codex` pinned to an exactly tested version.
+- Update README and config examples when endpoints, setup, defaults, or environment variables change.
+- Keep repository-authored work under MIT and preserve third-party licenses.
+- Portable releases must contain no credentials/cache/auth data, verify the Node archive checksum, and include license texts.
+- Before committing, run `npm.cmd run check`, `git diff --check`, and PowerShell syntax checks.
+- For App Server or streaming changes, run live Chat, Responses, and `/translate` smoke tests when credentials are available.

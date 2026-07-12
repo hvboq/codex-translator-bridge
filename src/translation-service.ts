@@ -4,14 +4,10 @@ import type { StructuredRunner } from './app-server-client.js';
 import { TranslationCache } from './cache.js';
 import {
   buildBatchPrompt,
-  buildChatPrompt,
-  chatSchema,
   translationSchema,
 } from './prompt.js';
 import { protectPlaceholders, restorePlaceholders, type Placeholder } from './placeholders.js';
 import type {
-  ChatMessage,
-  ChatTranslationResult,
   CodexModel,
   TranslationItem,
   TranslationRequest,
@@ -24,13 +20,6 @@ interface QueueEntry<T> {
   item: T;
   resolve: (value: string) => void;
   reject: (error: Error) => void;
-}
-
-interface ChatJob {
-  model: string;
-  runtimeModel: string;
-  messages: ChatMessage[];
-  placeholders: Placeholder[];
 }
 
 class MicroBatcher<T> {
@@ -106,9 +95,7 @@ class MicroBatcher<T> {
 
 export class TranslationService {
   private readonly translationBatcher: MicroBatcher<TranslationItem>;
-  private readonly chatBatcher: MicroBatcher<ChatJob>;
   private readonly inflightTranslations = new Map<string, Promise<string>>();
-  private readonly inflightChats = new Map<string, Promise<string>>();
 
   constructor(
     private readonly config: AppConfig,
@@ -120,12 +107,6 @@ export class TranslationService {
       config.batchWindowMs,
       (item) => item.runtimeModel,
       (items) => this.processTranslationBatch(items),
-    );
-    this.chatBatcher = new MicroBatcher(
-      config.maxBatchItems,
-      config.batchWindowMs,
-      (item) => item.runtimeModel,
-      (items) => this.processChatBatch(items),
     );
   }
 
@@ -201,52 +182,6 @@ export class TranslationService {
     };
   }
 
-  async translateChat(
-    messages: ChatMessage[],
-    requestedModelValue?: unknown,
-  ): Promise<ChatTranslationResult> {
-    if (!Array.isArray(messages) || messages.length === 0) {
-      throw new InputError('messages must be a non-empty array');
-    }
-    if (
-      messages.some(
-        (message) =>
-          !message ||
-          typeof message !== 'object' ||
-          Array.isArray(message) ||
-          typeof message.role !== 'string' ||
-          !('content' in message),
-      )
-    ) {
-      throw new InputError('Each message must contain a string role and content');
-    }
-    const serialized = JSON.stringify(messages);
-    if (serialized.length > this.config.maxTextChars * 2) {
-      throw new InputError('Chat messages exceed the configured character limit');
-    }
-    const requestedModel = normalizeRequestedModel(requestedModelValue);
-    const selectedModel = await this.runner.resolveModel(requestedModel);
-    const key = digest({ kind: 'chat-v1', messages, model: selectedModel.model });
-    const hit = this.cache.get(key);
-    if (hit !== undefined) {
-      return { content: hit, model: selectedModel.id };
-    }
-    const existing = this.inflightChats.get(key);
-    if (existing) {
-      return { content: await existing, model: selectedModel.id };
-    }
-    const protectedChat = protectChatMessages(messages, selectedModel);
-    const pending = this.chatBatcher
-      .enqueue(protectedChat)
-      .then(async (value) => {
-        await this.cache.set(key, value);
-        return value;
-      })
-      .finally(() => this.inflightChats.delete(key));
-    this.inflightChats.set(key, pending);
-    return { content: await pending, model: selectedModel.id };
-  }
-
   private async processTranslationBatch(items: TranslationItem[]): Promise<string[]> {
     const first = items[0];
     if (!first) {
@@ -262,25 +197,6 @@ export class TranslationService {
       const outputs = validateStringArray(parsed.translations, items.length, 'translations');
       return outputs.map((output, index) =>
         restorePlaceholders(output, items[index]?.placeholders ?? []),
-      );
-    });
-  }
-
-  private async processChatBatch(jobs: ChatJob[]): Promise<string[]> {
-    const first = jobs[0];
-    if (!first) {
-      return [];
-    }
-    return this.withOneRetry(async () => {
-      const response = await this.runner.runStructured(
-        buildChatPrompt(jobs.map((job) => job.messages)),
-        chatSchema(jobs.length),
-        { id: first.model, model: first.runtimeModel },
-      );
-      const parsed = parseObject(response);
-      const outputs = validateStringArray(parsed.contents, jobs.length, 'contents');
-      return outputs.map((output, index) =>
-        restorePlaceholders(output, jobs[index]?.placeholders ?? []),
       );
     });
   }
@@ -370,7 +286,7 @@ function createItem(
 ): TranslationItem {
   const protectedText = protectPlaceholders(text);
   const identity = {
-    kind: 'translation-v1',
+    kind: 'translation-v2',
     text,
     source,
     target,
@@ -433,57 +349,4 @@ function validateStringArray(value: unknown, count: number, name: string): strin
     throw new Error('Codex returned an invalid ' + name + ' array');
   }
   return value as string[];
-}
-
-function protectChatMessages(messages: ChatMessage[], selectedModel: CodexModel): ChatJob {
-  const cloned = structuredClone(messages);
-  const placeholders: Placeholder[] = [];
-  let userIndex = -1;
-  for (let index = cloned.length - 1; index >= 0; index -= 1) {
-    if (cloned[index]?.role === 'user') {
-      userIndex = index;
-      break;
-    }
-  }
-  if (userIndex < 0) {
-    return {
-      model: selectedModel.id,
-      runtimeModel: selectedModel.model,
-      messages: cloned,
-      placeholders,
-    };
-  }
-  const message = cloned[userIndex];
-  if (!message) {
-    return {
-      model: selectedModel.id,
-      runtimeModel: selectedModel.model,
-      messages: cloned,
-      placeholders,
-    };
-  }
-  if (typeof message.content === 'string') {
-    const protectedText = protectPlaceholders(message.content);
-    message.content = protectedText.text;
-    placeholders.push(...protectedText.placeholders);
-  } else if (Array.isArray(message.content)) {
-    message.content = message.content.map((part, partIndex) => {
-      if (!part || typeof part !== 'object') {
-        return part;
-      }
-      const copy = { ...(part as Record<string, unknown>) };
-      if (typeof copy.text === 'string') {
-        const protectedText = protectPlaceholders(copy.text, userIndex + '-' + partIndex);
-        copy.text = protectedText.text;
-        placeholders.push(...protectedText.placeholders);
-      }
-      return copy;
-    });
-  }
-  return {
-    model: selectedModel.id,
-    runtimeModel: selectedModel.model,
-    messages: cloned,
-    placeholders,
-  };
 }

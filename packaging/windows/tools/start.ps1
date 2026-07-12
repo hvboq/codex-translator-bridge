@@ -1,10 +1,20 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$env:CODEX_TRANSLATOR_HOME = $root
 $configFile = Join-Path $root "config.ps1"
 if (Test-Path -LiteralPath $configFile) {
     . $configFile
+}
+if (-not $env:CODEX_BRIDGE_HOME -and -not $env:CODEX_TRANSLATOR_HOME) {
+    $env:CODEX_BRIDGE_HOME = $root
+}
+
+function Get-EnvValue([string]$CurrentName, [string]$LegacyName, [string]$Fallback) {
+    $current = [Environment]::GetEnvironmentVariable($CurrentName)
+    if ($null -ne $current) { return $current }
+    $legacy = [Environment]::GetEnvironmentVariable($LegacyName)
+    if ($null -ne $legacy) { return $legacy }
+    return $Fallback
 }
 
 $node = Join-Path $root "runtime\node.exe"
@@ -27,9 +37,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "Codex Translator Bridge를 시작합니다." -ForegroundColor Green
-Write-Host "이 창을 닫으면 번역 서버도 종료됩니다. 종료하려면 Ctrl+C를 누르세요."
-Write-Host "LunaTranslator API Key는 'Copy Luna API Key.cmd'로 복사할 수 있습니다."
+Write-Host "Codex Bridge를 시작합니다." -ForegroundColor Green
+Write-Host "이 창을 닫으면 로컬 API 서버도 종료됩니다. 종료하려면 Ctrl+C를 누르세요."
+Write-Host "로컬 API Key는 'Copy Local API Key.cmd'로 복사할 수 있습니다."
+$hostName = Get-EnvValue "CODEX_BRIDGE_HOST" "CODEX_TRANSLATOR_HOST" "127.0.0.1"
+$uriHost = if ($hostName -eq "::1") { "[::1]" } else { $hostName }
+$port = Get-EnvValue "CODEX_BRIDGE_PORT" "CODEX_TRANSLATOR_PORT" "8765"
+Write-Host "OpenAI 호환 Base URL: http://$($uriHost):$port/v1"
 Write-Host ""
 
 & $node $application
