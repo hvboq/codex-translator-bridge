@@ -1,0 +1,29 @@
+{
+  "name": "codex-translator-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A localhost translation bridge that reuses Codex CLI authentication.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/src/main.js",
+    "codex:login": "codex login",
+    "codex:status": "codex login status",
+    "check": "npm run typecheck && npm test && npm run build",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@openai/codex": "0.144.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}
