@@ -104,6 +104,10 @@ test('resolves explicit models, the compatibility alias, and configured defaults
   assert.equal(resolveGpt56Model(models, 'GPT-5.6-TERRA').id, 'gpt-5.6-terra');
   assert.equal(resolveGpt56Model(models, undefined, 'gpt-5.6-terra').id, 'gpt-5.6-terra');
   assert.equal(
+    resolveGpt56Model(models, 'codex-bridge', 'gpt-5.6-terra').id,
+    'gpt-5.6-terra',
+  );
+  assert.equal(
     resolveGpt56Model(models, 'codex-translator', 'gpt-5.6-luna').id,
     'gpt-5.6-luna',
   );

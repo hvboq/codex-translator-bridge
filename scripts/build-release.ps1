@@ -55,7 +55,7 @@ if ($LASTEXITCODE -ne 0) {
 $distRoot = Join-Path $root "dist"
 $releaseRoot = Reset-SafeDirectory -Path (Join-Path $distRoot "release") -AllowedParent $distRoot
 $stageRoot = Join-Path $releaseRoot "stage"
-$packageRoot = Join-Path $stageRoot "CodexTranslatorBridge"
+$packageRoot = Join-Path $stageRoot "CodexBridge"
 $appRoot = Join-Path $packageRoot "app"
 $runtimeRoot = Join-Path $packageRoot "runtime"
 $licenseRoot = Join-Path $packageRoot "licenses"
@@ -107,7 +107,7 @@ Copy-Item -LiteralPath (Join-Path $root "third_party_licenses\openai-codex-Apach
 
 $commit = (& git rev-parse HEAD 2>$null).Trim()
 $manifest = [ordered]@{
-    name = "Codex Translator Bridge"
+    name = "Codex Bridge"
     version = $releaseVersion
     architecture = "windows-x64"
     nodeVersion = $nodeVersion
@@ -125,7 +125,7 @@ if ($LASTEXITCODE -ne 0 -or $codexVersionOutput -notmatch [regex]::Escape([strin
 }
 Push-Location -LiteralPath $packageRoot
 try {
-    $importCheck = "await import('./app/dist/src/http-server.js'); await import('./app/dist/src/translation-service.js');"
+    $importCheck = "await import('./app/dist/src/http-server.js'); await import('./app/dist/src/generation-service.js'); await import('./app/dist/src/translation-service.js');"
     & $bundledNode --input-type=module -e $importCheck
     if ($LASTEXITCODE -ne 0) {
         throw "Bundled application import verification failed with exit code $LASTEXITCODE."
@@ -134,7 +134,7 @@ try {
     Pop-Location
 }
 
-$zipName = "CodexTranslatorBridge-v$releaseVersion-windows-x64.zip"
+$zipName = "CodexBridge-v$releaseVersion-windows-x64.zip"
 $zipPath = Join-Path $releaseRoot $zipName
 Compress-Archive -LiteralPath $packageRoot -DestinationPath $zipPath -CompressionLevel Optimal
 $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()

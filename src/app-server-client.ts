@@ -7,8 +7,11 @@ import type {
   CodexModel,
   CodexModelSelection,
   CodexReasoningEffort,
+  TokenUsage,
 } from './types.js';
 import {
+  BRIDGE_BASE_INSTRUCTIONS,
+  BRIDGE_DEVELOPER_INSTRUCTIONS,
   TRANSLATOR_BASE_INSTRUCTIONS,
   TRANSLATOR_DEVELOPER_INSTRUCTIONS,
 } from './prompt.js';
@@ -29,7 +32,11 @@ interface PendingRequest {
 
 interface TurnWaiter {
   messages: string[];
-  resolve: (value: string) => void;
+  streamingItemIds: Set<string>;
+  onDelta?: (delta: string) => void;
+  removeAbortListener?: () => void;
+  usage: TokenUsage | null;
+  resolve: (value: TextRunResult) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
   settled: boolean;
@@ -43,6 +50,22 @@ export interface StructuredRunner {
     outputSchema: object,
     selection: CodexModelSelection,
   ): Promise<string>;
+  runText(
+    prompt: string,
+    selection: CodexModelSelection,
+    options?: TextRunOptions,
+  ): Promise<TextRunResult>;
+}
+
+export interface TextRunResult {
+  content: string;
+  usage: TokenUsage | null;
+}
+
+export interface TextRunOptions {
+  historyItems?: Array<Record<string, unknown>>;
+  onDelta?: (delta: string) => void;
+  signal?: AbortSignal;
 }
 
 export class UnsupportedModelError extends Error {
@@ -69,6 +92,7 @@ export class ModelUnavailableError extends Error {
 
 const MODEL_CACHE_TTL_MS = 60_000;
 const GPT_56_MODEL_PATTERN = /^gpt-5\.6(?:-|$)/i;
+const DEFAULT_MODEL_ALIASES = new Set(['codex-bridge', 'codex-translator']);
 
 export class CodexAppServerClient implements StructuredRunner {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -139,6 +163,27 @@ export class CodexAppServerClient implements StructuredRunner {
     outputSchema: object,
     selection: CodexModelSelection,
   ): Promise<string> {
+    return (await this.runTurn(prompt, selection, outputSchema, {}, true)).content;
+  }
+
+  async runText(
+    prompt: string,
+    selection: CodexModelSelection,
+    options: TextRunOptions = {},
+  ): Promise<TextRunResult> {
+    return this.runTurn(prompt, selection, undefined, options);
+  }
+
+  private async runTurn(
+    prompt: string,
+    selection: CodexModelSelection,
+    outputSchema?: object,
+    options: TextRunOptions = {},
+    translationMode = false,
+  ): Promise<TextRunResult> {
+    if (options.signal?.aborted) {
+      throw new Error('Codex generation was cancelled');
+    }
     const selectedModel = await this.resolveModel(selection.id);
     if (selectedModel.model !== selection.model) {
       throw new ModelUnavailableError(
@@ -146,6 +191,9 @@ export class CodexAppServerClient implements StructuredRunner {
       );
     }
     assertReasoningEffortSupported(selectedModel, this.config.reasoningEffort);
+    if (options.signal?.aborted) {
+      throw new Error('Codex generation was cancelled');
+    }
 
     const started = await this.request<{
       thread: { id: string };
@@ -157,9 +205,13 @@ export class CodexAppServerClient implements StructuredRunner {
         approvalPolicy: 'never',
         sandbox: 'read-only',
         ephemeral: true,
-        serviceName: 'codex_translator_bridge',
-        baseInstructions: TRANSLATOR_BASE_INSTRUCTIONS,
-        developerInstructions: TRANSLATOR_DEVELOPER_INSTRUCTIONS,
+        serviceName: 'codex_bridge',
+        baseInstructions: translationMode
+          ? TRANSLATOR_BASE_INSTRUCTIONS
+          : BRIDGE_BASE_INSTRUCTIONS,
+        developerInstructions: translationMode
+          ? TRANSLATOR_DEVELOPER_INSTRUCTIONS
+          : BRIDGE_DEVELOPER_INSTRUCTIONS,
         config: {
           web_search: 'disabled',
           mcp_servers: {},
@@ -184,27 +236,50 @@ export class CodexAppServerClient implements StructuredRunner {
       20_000,
     );
     const threadId = started.thread.id;
-    const result = this.waitForTurn(threadId);
+    if (options.signal?.aborted) {
+      void this.request('thread/unsubscribe', { threadId }, 5_000).catch(() => undefined);
+      throw new Error('Codex generation was cancelled');
+    }
+    if (options.historyItems?.length) {
+      try {
+        await this.request(
+          'thread/inject_items',
+          { threadId, items: options.historyItems },
+          20_000,
+        );
+      } catch (error) {
+        void this.request('thread/unsubscribe', { threadId }, 5_000).catch(() => undefined);
+        throw error;
+      }
+    }
+    const result = this.waitForTurn(threadId, options);
     void result.catch(() => undefined);
 
     try {
+      if (options.signal?.aborted) {
+        throw new Error('Codex generation was cancelled');
+      }
+      const turnParams: Record<string, unknown> = {
+        threadId,
+        input: [{ type: 'text', text: prompt }],
+        effort: this.config.reasoningEffort,
+        approvalPolicy: 'never',
+        sandboxPolicy: {
+          type: 'readOnly',
+          networkAccess: false,
+        },
+      };
+      if (outputSchema !== undefined) {
+        turnParams.outputSchema = outputSchema;
+      }
       await this.request(
         'turn/start',
-        {
-          threadId,
-          input: [{ type: 'text', text: prompt }],
-          effort: this.config.reasoningEffort,
-          outputSchema,
-          approvalPolicy: 'never',
-          sandboxPolicy: {
-            type: 'readOnly',
-            networkAccess: false,
-          },
-        },
+        turnParams,
         20_000,
       );
       return await result;
     } catch (error) {
+      void this.request('turn/interrupt', { threadId }, 5_000).catch(() => undefined);
       this.rejectTurn(threadId, error instanceof Error ? error : new Error(String(error)));
       await result.catch(() => undefined);
       throw error;
@@ -284,7 +359,7 @@ export class CodexAppServerClient implements StructuredRunner {
     const child = spawn(process.execPath, [launcher, 'app-server', '--listen', 'stdio://'], {
       env: {
         ...process.env,
-        CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'codex_translator_bridge',
+        CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'codex_bridge',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -311,9 +386,9 @@ export class CodexAppServerClient implements StructuredRunner {
       'initialize',
       {
         clientInfo: {
-          name: 'codex_translator_bridge',
-          title: 'Codex Translator Bridge',
-          version: '0.1.0',
+          name: 'codex_bridge',
+          title: 'Codex Bridge',
+          version: '0.2.0',
         },
         capabilities: {
           experimentalApi: false,
@@ -333,7 +408,7 @@ export class CodexAppServerClient implements StructuredRunner {
       ready,
       authMode,
       planType: account.account?.planType ?? null,
-      error: ready ? undefined : 'Run npm run codex:login before translating',
+      error: ready ? undefined : 'Run npm run codex:login before using Codex Bridge',
     };
   }
 
@@ -420,11 +495,63 @@ export class CodexAppServerClient implements StructuredRunner {
 
   private handleNotification(method: string, params: Record<string, unknown>): void {
     const threadId = typeof params.threadId === 'string' ? params.threadId : undefined;
+    if (method === 'thread/tokenUsage/updated' && threadId) {
+      const tokenUsage = params.tokenUsage as {
+        last?: Partial<TokenUsage>;
+      } | undefined;
+      const last = tokenUsage?.last;
+      if (last && isTokenUsage(last)) {
+        const waiter = this.turns.get(threadId);
+        if (waiter && !waiter.settled) {
+          waiter.usage = { ...last };
+        }
+      }
+      return;
+    }
+    if (method === 'item/started' && threadId) {
+      const item = params.item as {
+        id?: string;
+        type?: string;
+        phase?: string | null;
+      } | undefined;
+      if (item?.type === 'agentMessage' && item.phase === 'final_answer' && item.id) {
+        this.turns.get(threadId)?.streamingItemIds.add(item.id);
+      }
+      return;
+    }
+    if (method === 'item/agentMessage/delta' && threadId) {
+      const delta = typeof params.delta === 'string' ? params.delta : undefined;
+      const itemId = typeof params.itemId === 'string' ? params.itemId : undefined;
+      const waiter = this.turns.get(threadId);
+      if (
+        delta &&
+        itemId &&
+        waiter &&
+        waiter.streamingItemIds.has(itemId) &&
+        !waiter.settled
+      ) {
+        try {
+          waiter.onDelta?.(delta);
+        } catch (error) {
+          void this.request('turn/interrupt', { threadId }, 5_000).catch(() => undefined);
+          this.rejectTurn(
+            threadId,
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
+      }
+      return;
+    }
     if (method === 'item/completed' && threadId) {
-      const item = params.item as { type?: string; text?: string } | undefined;
+      const item = params.item as {
+        type?: string;
+        text?: string;
+        phase?: string | null;
+      } | undefined;
       if (
         item &&
         ['agentMessage', 'agent_message'].includes(item.type ?? '') &&
+        item.phase !== 'commentary' &&
         typeof item.text === 'string'
       ) {
         this.turns.get(threadId)?.messages.push(item.text);
@@ -433,6 +560,9 @@ export class CodexAppServerClient implements StructuredRunner {
     }
 
     if (method === 'error' && threadId) {
+      if (params.willRetry === true) {
+        return;
+      }
       const detail = params.error as { message?: string } | undefined;
       this.rejectTurn(threadId, new Error(detail?.message ?? 'Codex turn failed'));
       return;
@@ -446,25 +576,30 @@ export class CodexAppServerClient implements StructuredRunner {
       const turn = params.turn as {
         status?: string;
         error?: { message?: string } | null;
-        items?: Array<{ type?: string; text?: string }>;
+        items?: Array<{ type?: string; text?: string; phase?: string | null }>;
       } | undefined;
       if (turn?.status && turn.status !== 'completed') {
         this.rejectTurn(threadId, new Error(turn.error?.message ?? 'Codex turn ' + turn.status));
         return;
       }
       const itemMessages = turn?.items
-        ?.filter((item) => ['agentMessage', 'agent_message'].includes(item.type ?? ''))
+        ?.filter(
+          (item) =>
+            ['agentMessage', 'agent_message'].includes(item.type ?? '') &&
+            item.phase !== 'commentary',
+        )
         .map((item) => item.text)
         .filter((text): text is string => typeof text === 'string');
       const finalMessage = itemMessages?.at(-1) ?? waiter.messages.at(-1);
-      if (!finalMessage) {
+      if (finalMessage === undefined) {
         this.rejectTurn(threadId, new Error('Codex returned no final translation'));
         return;
       }
       waiter.settled = true;
       clearTimeout(waiter.timer);
+      waiter.removeAbortListener?.();
       this.turns.delete(threadId);
-      waiter.resolve(finalMessage);
+      waiter.resolve({ content: finalMessage, usage: waiter.usage });
     }
   }
 
@@ -489,13 +624,35 @@ export class CodexAppServerClient implements StructuredRunner {
     this.send({ id: message.id, result });
   }
 
-  private waitForTurn(threadId: string): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
+  private waitForTurn(threadId: string, options: TextRunOptions): Promise<TextRunResult> {
+    return new Promise<TextRunResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         void this.request('turn/interrupt', { threadId }, 5_000).catch(() => undefined);
-        this.rejectTurn(threadId, new Error('Codex translation timed out'));
+        this.rejectTurn(threadId, new Error('Codex generation timed out'));
       }, this.config.requestTimeoutMs);
-      this.turns.set(threadId, { messages: [], resolve, reject, timer, settled: false });
+      const abort = () => {
+        void this.request('turn/interrupt', { threadId }, 5_000).catch(() => undefined);
+        this.rejectTurn(threadId, new Error('Codex generation was cancelled'));
+      };
+      const removeAbortListener = options.signal
+        ? () => options.signal?.removeEventListener('abort', abort)
+        : undefined;
+      this.turns.set(threadId, {
+        messages: [],
+        streamingItemIds: new Set<string>(),
+        onDelta: options.onDelta,
+        removeAbortListener,
+        usage: null,
+        resolve,
+        reject,
+        timer,
+        settled: false,
+      });
+      if (options.signal?.aborted) {
+        queueMicrotask(abort);
+      } else {
+        options.signal?.addEventListener('abort', abort, { once: true });
+      }
     });
   }
 
@@ -506,6 +663,7 @@ export class CodexAppServerClient implements StructuredRunner {
     }
     waiter.settled = true;
     clearTimeout(waiter.timer);
+    waiter.removeAbortListener?.();
     this.turns.delete(threadId);
     waiter.reject(error);
   }
@@ -605,12 +763,14 @@ export function resolveGpt56Model(
     throw new UnsupportedModelError(requested, supportedIds);
   }
   const useConfiguredDefault =
-    requestedValue === undefined || requestedValue.toLowerCase() === 'codex-translator';
+    requestedValue === undefined || DEFAULT_MODEL_ALIASES.has(requestedValue.toLowerCase());
   const configuredValue = useConfiguredDefault ? configured?.trim() || undefined : undefined;
-  const configuredIsAlias = configuredValue?.toLowerCase() === 'codex-translator';
+  const configuredIsAlias = configuredValue
+    ? DEFAULT_MODEL_ALIASES.has(configuredValue.toLowerCase())
+    : false;
   const candidate = useConfiguredDefault && !configuredIsAlias ? configuredValue : requestedValue;
 
-  if (candidate && candidate.toLowerCase() !== 'codex-translator') {
+  if (candidate && !DEFAULT_MODEL_ALIASES.has(candidate.toLowerCase())) {
     const match = findModel(models, candidate);
     if (match) {
       return match;
@@ -699,6 +859,16 @@ function parseReasoningEffort(value: unknown): CodexReasoningEffort | null {
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function isTokenUsage(value: Partial<TokenUsage>): value is TokenUsage {
+  return [
+    value.totalTokens,
+    value.inputTokens,
+    value.cachedInputTokens,
+    value.outputTokens,
+    value.reasoningOutputTokens,
+  ].every((entry) => typeof entry === 'number' && Number.isFinite(entry) && entry >= 0);
 }
 
 function findModel(models: CodexModel[], requested: string): CodexModel | undefined {

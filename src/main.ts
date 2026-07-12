@@ -4,6 +4,7 @@ import { loadLocalAuth } from './auth.js';
 import { TranslationCache } from './cache.js';
 import { CodexAppServerClient } from './app-server-client.js';
 import { TranslationService } from './translation-service.js';
+import { GenerationService } from './generation-service.js';
 import { createHttpServer } from './http-server.js';
 
 async function main(): Promise<void> {
@@ -20,7 +21,8 @@ async function main(): Promise<void> {
 
   const client = new CodexAppServerClient(config);
   const translations = new TranslationService(config, client, cache);
-  const server = createHttpServer(config, localAuth.token, client, translations);
+  const generations = new GenerationService(config, client);
+  const server = createHttpServer(config, localAuth.token, client, translations, generations);
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -30,7 +32,7 @@ async function main(): Promise<void> {
     });
   });
 
-  console.log('Codex Translator Bridge listening on http://' + config.host + ':' + config.port);
+  console.log('Codex Bridge listening on http://' + config.host + ':' + config.port);
   if (localAuth.token === null) {
     console.log('Local bearer token check is disabled.');
   } else {
@@ -38,7 +40,7 @@ async function main(): Promise<void> {
   }
   console.log('Translation cache entries: ' + cache.size);
   if (localAuth.created) {
-    console.log('A new local bearer token was created. Copy it from the token file into LunaTranslator.');
+    console.log('A new local bearer token was created for OpenAI-compatible clients.');
   }
 
   void client.getStatus().then((status) => {

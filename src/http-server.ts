@@ -3,14 +3,12 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AppConfig } from './config.js';
 import { tokenMatches } from './auth.js';
 import { ModelUnavailableError, UnsupportedModelError } from './app-server-client.js';
+import {
+  GenerationService,
+  type PreparedGeneration,
+} from './generation-service.js';
 import { InputError, TranslationService } from './translation-service.js';
-import type { ChatMessage, CodexModel, TranslationRequest } from './types.js';
-
-interface ChatCompletionRequest {
-  model?: string;
-  messages?: ChatMessage[];
-  stream?: boolean;
-}
+import type { CodexModel, TokenUsage, TranslationRequest } from './types.js';
 
 interface StatusProvider {
   getStatus(): Promise<{
@@ -21,11 +19,14 @@ interface StatusProvider {
   }>;
 }
 
+type JsonObject = Record<string, unknown>;
+
 export function createHttpServer(
   config: AppConfig,
   localToken: string | null,
   client: StatusProvider,
   translations: TranslationService,
+  generations: GenerationService,
 ): http.Server {
   const server = http.createServer((request, response) => {
     void route(request, response).catch((error) => sendError(response, error));
@@ -41,13 +42,15 @@ export function createHttpServer(
 
     if (method === 'GET' && pathname === '/') {
       sendJson(response, 200, {
-        name: 'Codex Translator Bridge',
+        name: 'Codex Bridge',
+        compatibility: 'OpenAI-compatible text subset',
         endpoints: [
           '/health',
-          '/translate',
-          '/v1/chat/completions',
           '/v1/models',
           '/v1/models/{id}',
+          '/v1/chat/completions',
+          '/v1/responses',
+          '/translate (optional translation helper)',
         ],
       });
       return;
@@ -92,10 +95,7 @@ export function createHttpServer(
       return;
     }
 
-    if (
-      method === 'POST' &&
-      (pathname === '/translate' || pathname === '/v1/translate')
-    ) {
+    if (method === 'POST' && (pathname === '/translate' || pathname === '/v1/translate')) {
       const body = await readJson<TranslationRequest>(request, config.bodyLimitBytes);
       const result = await translations.translate(body);
       const isSingle = typeof body.text === 'string';
@@ -111,12 +111,46 @@ export function createHttpServer(
     }
 
     if (method === 'POST' && pathname === '/v1/chat/completions') {
-      const body = await readJson<ChatCompletionRequest>(request, config.bodyLimitBytes);
-      if (!Array.isArray(body.messages)) {
-        throw new InputError('messages must be an array');
+      const body = await readObject(request, config.bodyLimitBytes);
+      validateChatRequest(body);
+      const prepared = await generations.prepareChat(body.messages, body.model);
+      if (body.stream === true) {
+        await streamChatCompletion(request, response, generations, prepared, body);
+      } else {
+        const abortController = requestAbortController(request, response);
+        const result = await generations.generate(prepared, { signal: abortController.signal });
+        sendChatCompletion(response, result.content, result.model, result.usage);
       }
-      const result = await translations.translateChat(body.messages, body.model);
-      sendChatCompletion(response, result.content, result.model, body.stream === true);
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/v1/responses') {
+      const body = await readObject(request, config.bodyLimitBytes);
+      validateResponsesRequest(body);
+      const prepared = await generations.prepareResponse(
+        body.input,
+        body.instructions,
+        body.model,
+      );
+      if (body.stream === true) {
+        await streamResponse(request, response, generations, prepared, body);
+      } else {
+        const abortController = requestAbortController(request, response);
+        const result = await generations.generate(prepared, { signal: abortController.signal });
+        const ids = responseIds();
+        sendJson(
+          response,
+          200,
+          createResponseObject(
+            ids,
+            result.model,
+            result.content,
+            body,
+            'completed',
+            result.usage,
+          ),
+        );
+      }
       return;
     }
 
@@ -124,6 +158,14 @@ export function createHttpServer(
       error: { message: 'Route not found', type: 'not_found_error' },
     });
   }
+}
+
+async function readObject(request: IncomingMessage, limit: number): Promise<JsonObject> {
+  const value = await readJson<unknown>(request, limit);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InputError('Request body must be an object');
+  }
+  return value as JsonObject;
 }
 
 async function readJson<T>(request: IncomingMessage, limit: number): Promise<T> {
@@ -149,64 +191,531 @@ async function readJson<T>(request: IncomingMessage, limit: number): Promise<T> 
   }
 }
 
+function validateChatRequest(body: JsonObject): void {
+  validateStream(body.stream);
+  if (body.n !== undefined && body.n !== 1) {
+    throw new InputError('Only n=1 is supported');
+  }
+  if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.length > 0)) {
+    throw new InputError('Tool calling is not supported');
+  }
+  if (body.tool_choice !== undefined && body.tool_choice !== 'none') {
+    throw new InputError('Only tool_choice="none" is supported');
+  }
+  rejectPresent(body, [
+    'functions',
+    'function_call',
+    'audio',
+    'max_tokens',
+    'max_completion_tokens',
+    'temperature',
+    'top_p',
+    'stop',
+    'presence_penalty',
+    'frequency_penalty',
+    'seed',
+    'logit_bias',
+    'logprobs',
+    'top_logprobs',
+    'reasoning_effort',
+    'verbosity',
+    'service_tier',
+    'prediction',
+    'web_search_options',
+  ]);
+  if (body.stream_options !== undefined) {
+    if (body.stream !== true) {
+      throw new InputError('stream_options requires stream=true');
+    }
+    const options = body.stream_options;
+    if (
+      !options ||
+      typeof options !== 'object' ||
+      Array.isArray(options) ||
+      Object.keys(options).some((key) => key !== 'include_usage') ||
+      ((options as JsonObject).include_usage !== undefined &&
+        typeof (options as JsonObject).include_usage !== 'boolean')
+    ) {
+      throw new InputError('stream_options supports only include_usage');
+    }
+  }
+  if (body.modalities !== undefined) {
+    if (
+      !Array.isArray(body.modalities) ||
+      body.modalities.length !== 1 ||
+      body.modalities[0] !== 'text'
+    ) {
+      throw new InputError('Only text output is supported');
+    }
+  }
+  if (body.response_format !== undefined) {
+    const format = body.response_format;
+    if (
+      !format ||
+      typeof format !== 'object' ||
+      Array.isArray(format) ||
+      (format as JsonObject).type !== 'text'
+    ) {
+      throw new InputError('Only text response_format is supported');
+    }
+  }
+}
+
+function validateResponsesRequest(body: JsonObject): void {
+  validateStream(body.stream);
+  if (!Object.hasOwn(body, 'input')) {
+    throw new InputError('input is required');
+  }
+  if (body.store === true) {
+    throw new InputError('Stored responses are not supported');
+  }
+  if (body.background === true) {
+    throw new InputError('Background responses are not supported');
+  }
+  if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.length > 0)) {
+    throw new InputError('Tool calling is not supported');
+  }
+  if (body.tool_choice !== undefined && body.tool_choice !== 'none') {
+    throw new InputError('Only tool_choice="none" is supported');
+  }
+  if (body.parallel_tool_calls !== undefined && body.parallel_tool_calls !== false) {
+    throw new InputError('parallel_tool_calls is not supported');
+  }
+  if (body.truncation !== undefined && body.truncation !== 'disabled') {
+    throw new InputError('Only truncation="disabled" is supported');
+  }
+  rejectPresent(body, [
+    'previous_response_id',
+    'conversation',
+    'prompt',
+    'max_output_tokens',
+    'max_tool_calls',
+    'temperature',
+    'top_p',
+    'reasoning',
+    'service_tier',
+  ]);
+  if (body.text !== undefined) {
+    const text = body.text;
+    if (!text || typeof text !== 'object' || Array.isArray(text)) {
+      throw new InputError('text must be an object');
+    }
+    const format = (text as JsonObject).format;
+    if (format !== undefined) {
+      if (
+        !format ||
+        typeof format !== 'object' ||
+        Array.isArray(format) ||
+        (format as JsonObject).type !== 'text'
+      ) {
+        throw new InputError('Only plain text responses are supported');
+      }
+    }
+  }
+}
+
+function validateStream(value: unknown): void {
+  if (value !== undefined && typeof value !== 'boolean') {
+    throw new InputError('stream must be a boolean');
+  }
+}
+
+function rejectPresent(body: JsonObject, fields: string[]): void {
+  const field = fields.find((name) => body[name] !== undefined && body[name] !== null);
+  if (field) {
+    throw new InputError(field + ' is not supported');
+  }
+}
+
 function sendChatCompletion(
   response: ServerResponse,
   content: string,
   model: string,
-  stream: boolean,
+  usage: TokenUsage | null,
 ): void {
-  const id = 'chatcmpl-' + randomUUID();
-  const created = Math.floor(Date.now() / 1000);
-  if (stream) {
-    response.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-    response.write(
-      'data: ' +
-        JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }],
-        }) +
-        '\n\n',
-    );
-    response.write(
-      'data: ' +
-        JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        }) +
-        '\n\n',
-    );
-    response.end('data: [DONE]\n\n');
-    return;
-  }
-
   sendJson(response, 200, {
-    id,
+    id: 'chatcmpl-' + randomUUID(),
     object: 'chat.completion',
-    created,
+    created: Math.floor(Date.now() / 1000),
     model,
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content },
+        message: { role: 'assistant', content, refusal: null, annotations: [] },
+        logprobs: null,
         finish_reason: 'stop',
       },
     ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: toChatUsage(usage),
   });
 }
 
+async function streamChatCompletion(
+  request: IncomingMessage,
+  response: ServerResponse,
+  generations: GenerationService,
+  prepared: PreparedGeneration,
+  requestBody: JsonObject,
+): Promise<void> {
+  const id = 'chatcmpl-' + randomUUID();
+  const created = Math.floor(Date.now() / 1000);
+  const abortController = requestAbortController(request, response);
+  const includeUsage =
+    (requestBody.stream_options as JsonObject | undefined)?.include_usage === true;
+  let streamed = '';
+  try {
+    const result = await generations.generate(prepared, {
+      signal: abortController.signal,
+      onReady: () => {
+        startSse(response);
+        writeChatChunk(
+          response,
+          id,
+          created,
+          prepared.model.id,
+          { role: 'assistant', content: '' },
+          null,
+        );
+      },
+      onDelta: (delta) => {
+        streamed += delta;
+        writeChatChunk(response, id, created, prepared.model.id, { content: delta }, null);
+      },
+    });
+    if (!streamed && result.content) {
+      streamed = result.content;
+      writeChatChunk(response, id, created, result.model, { content: result.content }, null);
+    }
+    if (streamed !== result.content) {
+      throw new Error('Codex streamed output did not match the final response');
+    }
+    writeChatChunk(response, id, created, result.model, {}, 'stop');
+    if (includeUsage) {
+      writeSseData(response, {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model: result.model,
+        choices: [],
+        usage: toChatUsage(result.usage),
+      });
+    }
+    response.end('data: [DONE]\n\n');
+  } catch (error) {
+    if (!response.headersSent) {
+      throw error;
+    }
+    if (!response.destroyed) {
+      writeSseData(response, { error: streamErrorBody(error) });
+      response.end();
+    }
+  }
+}
+
+function writeChatChunk(
+  response: ServerResponse,
+  id: string,
+  created: number,
+  model: string,
+  delta: JsonObject,
+  finishReason: string | null,
+): void {
+  writeSseData(response, {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }],
+  });
+}
+
+async function streamResponse(
+  request: IncomingMessage,
+  response: ServerResponse,
+  generations: GenerationService,
+  prepared: PreparedGeneration,
+  requestBody: JsonObject,
+): Promise<void> {
+  const ids = responseIds();
+  const abortController = requestAbortController(request, response);
+  let sequence = 0;
+  let streamed = '';
+  const event = (type: string, body: JsonObject) => {
+    writeResponseEvent(response, {
+      type,
+      sequence_number: sequence++,
+      ...body,
+    });
+  };
+  try {
+    const result = await generations.generate(prepared, {
+      signal: abortController.signal,
+      onReady: () => {
+        startSse(response);
+        event('response.created', {
+          response: createResponseObject(
+            ids,
+            prepared.model.id,
+            '',
+            requestBody,
+            'in_progress',
+            null,
+          ),
+        });
+        event('response.in_progress', {
+          response: createResponseObject(
+            ids,
+            prepared.model.id,
+            '',
+            requestBody,
+            'in_progress',
+            null,
+          ),
+        });
+        event('response.output_item.added', {
+          output_index: 0,
+          item: responseMessage(ids.messageId, '', 'in_progress'),
+        });
+        event('response.content_part.added', {
+          item_id: ids.messageId,
+          output_index: 0,
+          content_index: 0,
+          part: outputTextPart(''),
+        });
+      },
+      onDelta: (delta) => {
+        streamed += delta;
+        event('response.output_text.delta', {
+          item_id: ids.messageId,
+          output_index: 0,
+          content_index: 0,
+          delta,
+          logprobs: [],
+        });
+      },
+    });
+    if (!streamed && result.content) {
+      streamed = result.content;
+      event('response.output_text.delta', {
+        item_id: ids.messageId,
+        output_index: 0,
+        content_index: 0,
+        delta: result.content,
+        logprobs: [],
+      });
+    }
+    if (streamed !== result.content) {
+      throw new Error('Codex streamed output did not match the final response');
+    }
+    event('response.output_text.done', {
+      item_id: ids.messageId,
+      output_index: 0,
+      content_index: 0,
+      text: result.content,
+      logprobs: [],
+    });
+    event('response.content_part.done', {
+      item_id: ids.messageId,
+      output_index: 0,
+      content_index: 0,
+      part: outputTextPart(result.content),
+    });
+    event('response.output_item.done', {
+      output_index: 0,
+      item: responseMessage(ids.messageId, result.content, 'completed'),
+    });
+    event('response.completed', {
+      response: createResponseObject(
+        ids,
+        result.model,
+        result.content,
+        requestBody,
+        'completed',
+        result.usage,
+      ),
+    });
+    response.end();
+  } catch (error) {
+    if (!response.headersSent) {
+      throw error;
+    }
+    if (!response.destroyed) {
+      event('error', {
+        code: 'codex_bridge_error',
+        message: errorMessage(error),
+        param: null,
+      });
+      event('response.failed', {
+        response: createFailedResponse(ids, prepared.model.id, requestBody, error),
+      });
+      response.end();
+    }
+  }
+}
+
+interface ResponseIds {
+  responseId: string;
+  messageId: string;
+  createdAt: number;
+}
+
+function responseIds(): ResponseIds {
+  return {
+    responseId: 'resp_' + randomUUID().replaceAll('-', ''),
+    messageId: 'msg_' + randomUUID().replaceAll('-', ''),
+    createdAt: Math.floor(Date.now() / 1000),
+  };
+}
+
+function createResponseObject(
+  ids: ResponseIds,
+  model: string,
+  content: string,
+  requestBody: JsonObject,
+  status: 'in_progress' | 'completed',
+  usage: TokenUsage | null,
+): JsonObject {
+  const completed = status === 'completed';
+  return {
+    id: ids.responseId,
+    object: 'response',
+    created_at: ids.createdAt,
+    status,
+    completed_at: completed ? Math.floor(Date.now() / 1000) : null,
+    error: null,
+    incomplete_details: null,
+    instructions: typeof requestBody.instructions === 'string' ? requestBody.instructions : null,
+    max_output_tokens: null,
+    model,
+    output: completed ? [responseMessage(ids.messageId, content, 'completed')] : [],
+    output_text: completed ? content : '',
+    parallel_tool_calls: false,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: false,
+    temperature: null,
+    text: { format: { type: 'text' } },
+    tool_choice: 'none',
+    tools: [],
+    top_p: null,
+    truncation: 'disabled',
+    usage: completed ? toResponseUsage(usage) : null,
+    metadata:
+      requestBody.metadata && typeof requestBody.metadata === 'object'
+        ? requestBody.metadata
+        : {},
+  };
+}
+
+function createFailedResponse(
+  ids: ResponseIds,
+  model: string,
+  requestBody: JsonObject,
+  error: unknown,
+): JsonObject {
+  return {
+    ...createResponseObject(ids, model, '', requestBody, 'in_progress', null),
+    status: 'failed',
+    completed_at: Math.floor(Date.now() / 1000),
+    error: { code: 'codex_bridge_error', message: errorMessage(error) },
+  };
+}
+
+function responseMessage(
+  id: string,
+  content: string,
+  status: 'in_progress' | 'completed',
+): JsonObject {
+  return {
+    id,
+    type: 'message',
+    status,
+    role: 'assistant',
+    content: status === 'completed' ? [outputTextPart(content)] : [],
+  };
+}
+
+function outputTextPart(text: string): JsonObject {
+  return { type: 'output_text', text, annotations: [], logprobs: [] };
+}
+
+function toChatUsage(usage: TokenUsage | null): JsonObject | null {
+  if (!usage) {
+    return null;
+  }
+  return {
+    prompt_tokens: usage.inputTokens,
+    completion_tokens: usage.outputTokens,
+    total_tokens: usage.totalTokens,
+    prompt_tokens_details: { cached_tokens: usage.cachedInputTokens, audio_tokens: 0 },
+    completion_tokens_details: {
+      reasoning_tokens: usage.reasoningOutputTokens,
+      audio_tokens: 0,
+      accepted_prediction_tokens: 0,
+      rejected_prediction_tokens: 0,
+    },
+  };
+}
+
+function toResponseUsage(usage: TokenUsage | null): JsonObject | null {
+  if (!usage) {
+    return null;
+  }
+  return {
+    input_tokens: usage.inputTokens,
+    input_tokens_details: { cached_tokens: usage.cachedInputTokens },
+    output_tokens: usage.outputTokens,
+    output_tokens_details: { reasoning_tokens: usage.reasoningOutputTokens },
+    total_tokens: usage.totalTokens,
+  };
+}
+
+function requestAbortController(
+  request: IncomingMessage,
+  response: ServerResponse,
+): AbortController {
+  const controller = new AbortController();
+  request.once('aborted', () => controller.abort());
+  response.once('close', () => {
+    if (!response.writableEnded) {
+      controller.abort();
+    }
+  });
+  return controller;
+}
+
+function startSse(response: ServerResponse): void {
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.flushHeaders();
+}
+
+function writeSseData(response: ServerResponse, value: unknown): void {
+  if (!response.destroyed && !response.writableEnded) {
+    if (!response.write('data: ' + JSON.stringify(value) + '\n\n')) {
+      throw new Error('SSE client is too slow');
+    }
+  }
+}
+
+function writeResponseEvent(response: ServerResponse, value: JsonObject): void {
+  if (!response.destroyed && !response.writableEnded) {
+    const frame =
+      'event: ' + value.type + '\n' + 'data: ' + JSON.stringify(value) + '\n\n';
+    if (!response.write(frame)) {
+      throw new Error('SSE client is too slow');
+    }
+  }
+}
+
 function sendJson(response: ServerResponse, statusCode: number, value: unknown): void {
+  if (response.destroyed) {
+    return;
+  }
   if (response.headersSent) {
     response.end();
     return;
@@ -238,7 +747,7 @@ function decodeModelId(value: string): string {
   }
 }
 
-function toModelResponse(model: CodexModel): Record<string, unknown> {
+function toModelResponse(model: CodexModel): JsonObject {
   return {
     id: model.id,
     object: 'model',
@@ -254,12 +763,24 @@ function toModelResponse(model: CodexModel): Record<string, unknown> {
   };
 }
 
+function streamErrorBody(error: unknown): JsonObject {
+  return {
+    message: errorMessage(error),
+    type: 'codex_bridge_error',
+    code: 'codex_bridge_error',
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function sendError(response: ServerResponse, error: unknown): void {
   if (response.headersSent) {
     response.end();
     return;
   }
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   const status =
     error instanceof InputError || error instanceof UnsupportedModelError
       ? 400

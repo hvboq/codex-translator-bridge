@@ -33,11 +33,21 @@ export interface TranslationItem {
 export interface ChatMessage {
   role: string;
   content: unknown;
+  name?: unknown;
 }
 
-export interface ChatTranslationResult {
+export interface TextGenerationResult {
   content: string;
   model: string;
+  usage: TokenUsage | null;
+}
+
+export interface TokenUsage {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
 }
 
 export interface CodexReasoningEffort {

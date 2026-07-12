@@ -40,4 +40,4 @@ jobs:
         run: |
           $assets = @(Get-ChildItem -LiteralPath "dist/release" -File | Where-Object { $_.Extension -in @(".zip", ".sha256") } | ForEach-Object { $_.FullName })
           if ($assets.Count -ne 2) { throw "Expected a ZIP and SHA-256 file, found $($assets.Count)." }
-          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --generate-notes --title "Codex Translator Bridge $env:GITHUB_REF_NAME"
+          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --generate-notes --title "Codex Bridge $env:GITHUB_REF_NAME"

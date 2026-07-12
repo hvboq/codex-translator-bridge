@@ -1,6 +1,6 @@
 # Third-party notices
 
-Codex Translator Bridge's repository-authored source code and documentation are licensed under the root [MIT License](LICENSE).
+Codex Bridge's repository-authored source code and documentation are licensed under the root [MIT License](LICENSE).
 
 Installing dependencies with `npm ci` downloads third-party packages that remain under their own licenses. They are not relicensed by this repository. Direct dependencies currently include:
 

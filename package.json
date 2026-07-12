@@ -1,8 +1,8 @@
 {
-  "name": "codex-translator-bridge",
-  "version": "0.1.0",
+  "name": "codex-bridge",
+  "version": "0.2.0",
   "private": true,
-  "description": "A localhost translation bridge that reuses Codex CLI authentication.",
+  "description": "A localhost OpenAI-compatible text gateway backed by the official Codex App Server.",
   "license": "MIT",
   "type": "module",
   "engines": {
