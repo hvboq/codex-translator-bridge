@@ -33,10 +33,12 @@ class HttpFakeRunner implements StructuredRunner {
   readonly abortedPrompts: string[] = [];
   readonly structuredCalls: Array<{ model: string; prompt: string }> = [];
   readonly textCalls: Array<{
+    developerInstructions?: string;
     historyItems: Array<Record<string, unknown>>;
     model: string;
     prompt: string;
     reasoningEffort?: string;
+    systemInstructions?: string;
   }> = [];
 
   async listModels(): Promise<CodexModel[]> {
@@ -84,10 +86,12 @@ class HttpFakeRunner implements StructuredRunner {
     };
   }> {
     this.textCalls.push({
+      developerInstructions: options.developerInstructions,
       historyItems: structuredClone(options.historyItems ?? []),
       model: selection.model,
       prompt,
       reasoningEffort: options.reasoningEffort,
+      systemInstructions: options.systemInstructions,
     });
     await options.onReady?.();
     if (prompt === 'FAIL') {
@@ -176,6 +180,7 @@ test('serves general OpenAI-compatible APIs and keeps translate optional', async
     body: JSON.stringify({
       model: 'codex-bridge',
       messages: [
+        { role: 'system', content: 'Answer in Korean.' },
         { role: 'developer', content: 'Be concise.' },
         { role: 'assistant', content: 'Ready.' },
         { role: 'user', content: 'Hello' },
@@ -202,12 +207,9 @@ test('serves general OpenAI-compatible APIs and keeps translate optional', async
     },
   });
   assert.equal(runner.textCalls.at(-1)?.prompt, 'Hello');
+  assert.equal(runner.textCalls.at(-1)?.systemInstructions, 'Answer in Korean.');
+  assert.equal(runner.textCalls.at(-1)?.developerInstructions, 'Be concise.');
   assert.deepEqual(runner.textCalls.at(-1)?.historyItems, [
-    {
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: 'Be concise.' }],
-    },
     {
       type: 'message',
       role: 'assistant',
@@ -220,7 +222,10 @@ test('serves general OpenAI-compatible APIs and keeps translate optional', async
     body: JSON.stringify({
       model: 'gpt-5.6-luna',
       instructions: 'Answer briefly.',
-      input: 'Status?',
+      input: [
+        { type: 'message', role: 'system', content: 'Answer in Korean.' },
+        { type: 'message', role: 'user', content: 'Status?' },
+      ],
     }),
   });
   const responseJson = await response.json() as {
@@ -238,6 +243,9 @@ test('serves general OpenAI-compatible APIs and keeps translate optional', async
   assert.equal(responseJson.usage.input_tokens, 10);
   assert.equal(responseJson.usage.output_tokens, 5);
   assert.equal(runner.textCalls.at(-1)?.model, 'gpt-5.6-runtime-luna');
+  assert.equal(runner.textCalls.at(-1)?.systemInstructions, 'Answer in Korean.');
+  assert.equal(runner.textCalls.at(-1)?.developerInstructions, 'Answer briefly.');
+  assert.deepEqual(runner.textCalls.at(-1)?.historyItems, []);
 });
 
 test('streams real Chat deltas and typed Responses events in order', async (context) => {
@@ -254,7 +262,11 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
       top_p: 0.3,
       reasoning_effort: 'xhign',
       thinking: { type: 'enabled' },
-      messages: [{ role: 'user', content: 'Hello' }],
+      messages: [
+        { role: 'system', content: 'Stream in Korean.' },
+        { role: 'developer', content: 'Keep it short.' },
+        { role: 'user', content: 'Hello' },
+      ],
     }),
   });
   assert.match(chat.headers.get('content-type') ?? '', /text\/event-stream/);
@@ -277,12 +289,15 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
   assert.equal(chatChunks.at(-1).usage.total_tokens, 15);
   assert.equal(runner.textCalls.at(-1)?.model, 'gpt-5.6-runtime-luna');
   assert.equal(runner.textCalls.at(-1)?.reasoningEffort, 'xhigh');
+  assert.equal(runner.textCalls.at(-1)?.systemInstructions, 'Stream in Korean.');
+  assert.equal(runner.textCalls.at(-1)?.developerInstructions, 'Keep it short.');
 
   const responses = await authorizedFetch(base + '/v1/responses', {
     method: 'POST',
     body: JSON.stringify({
       stream: true,
       model: 'gpt-5.6-sol',
+      instructions: 'Keep it short.',
       input: 'Hello',
       reasoning: { effort: 'high' },
     }),
@@ -319,6 +334,7 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
   assert.ok(responseSnapshots.length >= 3);
   assert.ok(responseSnapshots.every((entry) => entry.reasoning.effort === 'high'));
   assert.equal(runner.textCalls.at(-1)?.reasoningEffort, 'high');
+  assert.equal(runner.textCalls.at(-1)?.developerInstructions, 'Keep it short.');
 });
 
 test('accepts validated max token aliases used by OpenAI-compatible clients', async (context) => {

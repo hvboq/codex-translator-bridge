@@ -13,12 +13,14 @@ import type {
 } from './types.js';
 
 export interface PreparedGeneration {
+  developerInstructions?: string;
   historyItems: Array<Record<string, unknown>>;
   input: string;
   messages: ChatMessage[];
   model: CodexModel;
   reasoningEffort: string;
   reasoningFallback?: string;
+  systemInstructions?: string;
 }
 
 export type GenerationRunOptions = TextRunOptions;
@@ -83,7 +85,9 @@ export class GenerationService {
       const maxOutputChars = this.config.maxTextChars * 4;
       let streamedChars = 0;
       const {
+        developerInstructions: _developerInstructions,
         reasoningEffort: _reasoningEffort,
+        systemInstructions: _systemInstructions,
         ...runOptions
       } = options;
       const result = await this.runner.runText(
@@ -91,8 +95,14 @@ export class GenerationService {
         { id: prepared.model.id, model: prepared.model.model },
         {
           ...runOptions,
+          ...(prepared.developerInstructions !== undefined
+            ? { developerInstructions: prepared.developerInstructions }
+            : {}),
           historyItems: prepared.historyItems,
           reasoningEffort: prepared.reasoningEffort,
+          ...(prepared.systemInstructions !== undefined
+            ? { systemInstructions: prepared.systemInstructions }
+            : {}),
           onDelta: (delta) => {
             streamedChars += delta.length;
             if (streamedChars > maxOutputChars) {
@@ -131,8 +141,14 @@ export class GenerationService {
     if (!finalMessage || finalMessage.role !== 'user' || typeof finalMessage.content !== 'string') {
       throw new InputError('The final message must be a user text message');
     }
+    const priorMessages = messages.slice(0, -1);
+    const systemInstructions = combineRoleInstructions(priorMessages, 'system');
+    const developerInstructions = combineRoleInstructions(priorMessages, 'developer');
     return {
-      historyItems: messages.slice(0, -1).map(toHistoryItem),
+      ...(developerInstructions !== undefined ? { developerInstructions } : {}),
+      historyItems: priorMessages
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map(toHistoryItem),
       input: finalMessage.content,
       messages,
       model,
@@ -140,6 +156,7 @@ export class GenerationService {
       ...(resolvedReasoning.fallback
         ? { reasoningFallback: resolvedReasoning.fallback }
         : {}),
+      ...(systemInstructions !== undefined ? { systemInstructions } : {}),
     };
   }
 
@@ -331,6 +348,17 @@ function toHistoryItem(message: ChatMessage): Record<string, unknown> {
       },
     ],
   };
+}
+
+function combineRoleInstructions(
+  messages: ChatMessage[],
+  role: 'system' | 'developer',
+): string | undefined {
+  const instructions = messages
+    .filter((message) => message.role === role)
+    .map((message) => message.content)
+    .filter((content): content is string => typeof content === 'string' && content.length > 0);
+  return instructions.length > 0 ? instructions.join('\n\n') : undefined;
 }
 
 function normalizeContent(value: unknown, field: string): string {

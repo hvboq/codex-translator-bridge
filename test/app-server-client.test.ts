@@ -10,6 +10,12 @@ import {
   UnsupportedModelError,
 } from '../src/app-server-client.js';
 import type { AppConfig } from '../src/config.js';
+import {
+  BRIDGE_BASE_INSTRUCTIONS,
+  BRIDGE_DEVELOPER_INSTRUCTIONS,
+  TRANSLATOR_BASE_INSTRUCTIONS,
+  TRANSLATOR_DEVELOPER_INSTRUCTIONS,
+} from '../src/prompt.js';
 import type { CodexModel } from '../src/types.js';
 
 const RAW_MODELS = [
@@ -174,7 +180,7 @@ test('checks configured reasoning effort against the selected model catalog entr
   );
 });
 
-test('passes request reasoning effort to turn/start and revalidates the live catalog', async () => {
+test('passes request instructions and reasoning to the correct App Server fields', async () => {
   const client = new CodexAppServerClient(
     clientConfig({ reasoningEffort: 'none' }),
     () => undefined,
@@ -184,6 +190,7 @@ test('passes request reasoning effort to turn/start and revalidates the live cat
   const model = selected as CodexModel;
   client.resolveModel = async () => model;
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const sequence: string[] = [];
   const harness = client as unknown as {
     request(
       method: string,
@@ -193,23 +200,79 @@ test('passes request reasoning effort to turn/start and revalidates the live cat
     waitForTurn(): Promise<{ content: string; usage: null }>;
   };
   harness.request = async (method, params) => {
+    sequence.push(method);
     calls.push({ method, params });
     return method === 'thread/start' ? { thread: { id: 'thread-test' } } : {};
   };
-  harness.waitForTurn = async () => ({ content: 'OK', usage: null });
+  harness.waitForTurn = async () => {
+    sequence.push('waitForTurn');
+    return { content: 'OK', usage: null };
+  };
 
   let ready = false;
+  const historyItems = [
+    {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'Earlier question' }],
+    },
+    {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'Earlier answer' }],
+    },
+  ];
   const result = await client.runText(
     'Hello',
     { id: model.id, model: model.model },
-    { reasoningEffort: 'high', onReady: () => { ready = true; } },
+    {
+      developerInstructions: 'Preserve the requested format.',
+      historyItems,
+      reasoningEffort: 'high',
+      systemInstructions: 'Translate only into Korean.',
+      onReady: () => {
+        sequence.push('onReady');
+        ready = true;
+      },
+    },
   );
   assert.deepEqual(result, { content: 'OK', usage: null });
   assert.equal(ready, true);
+  assert.deepEqual(sequence.slice(0, 6), [
+    'thread/start',
+    'thread/inject_items',
+    'onReady',
+    'waitForTurn',
+    'turn/start',
+    'thread/unsubscribe',
+  ]);
+  const threadStart = calls.find((call) => call.method === 'thread/start');
+  const baseInstructions = threadStart?.params.baseInstructions;
+  const developerInstructions = threadStart?.params.developerInstructions;
+  assert.equal(typeof baseInstructions, 'string');
+  assert.equal(typeof developerInstructions, 'string');
+  assert.match(baseInstructions as string, /Translate only into Korean\./);
+  assert.match(developerInstructions as string, /Preserve the requested format\./);
+  assert.ok((baseInstructions as string).endsWith(BRIDGE_BASE_INSTRUCTIONS));
+  assert.ok((developerInstructions as string).endsWith(BRIDGE_DEVELOPER_INSTRUCTIONS));
+  assert.ok(
+    (baseInstructions as string).indexOf('Translate only into Korean.') <
+      (baseInstructions as string).indexOf(BRIDGE_BASE_INSTRUCTIONS),
+  );
+  assert.ok(
+    (developerInstructions as string).indexOf('Preserve the requested format.') <
+      (developerInstructions as string).indexOf(BRIDGE_DEVELOPER_INSTRUCTIONS),
+  );
+  const injectItems = calls.find((call) => call.method === 'thread/inject_items');
+  assert.deepEqual(injectItems?.params.items, historyItems);
+  assert.deepEqual(
+    (injectItems?.params.items as Array<{ role: string }>).map((item) => item.role),
+    ['user', 'assistant'],
+  );
   const turnStart = calls.find((call) => call.method === 'turn/start');
   assert.equal(turnStart?.params.effort, 'high');
   assert.equal(
-    calls.find((call) => call.method === 'thread/start')?.params.effort,
+    threadStart?.params.effort,
     undefined,
   );
 
@@ -223,6 +286,20 @@ test('passes request reasoning effort to turn/start and revalidates the live cat
     calls.find((call) => call.method === 'turn/start')?.params.effort,
     'low',
   );
+
+  calls.length = 0;
+  await client.runStructured(
+    'Translate this',
+    { type: 'object' },
+    { id: model.id, model: model.model },
+  );
+  const structuredThreadStart = calls.find((call) => call.method === 'thread/start');
+  assert.equal(structuredThreadStart?.params.baseInstructions, TRANSLATOR_BASE_INSTRUCTIONS);
+  assert.equal(
+    structuredThreadStart?.params.developerInstructions,
+    TRANSLATOR_DEVELOPER_INSTRUCTIONS,
+  );
+  assert.equal(calls.some((call) => call.method === 'thread/inject_items'), false);
 
   calls.length = 0;
   ready = false;
@@ -248,6 +325,58 @@ test('passes request reasoning effort to turn/start and revalidates the live cat
   );
   assert.equal(calls.length, 0);
   assert.equal(ready, false);
+});
+
+test('does not mark a request ready when sanitized history injection fails', async () => {
+  const client = new CodexAppServerClient(clientConfig(), () => undefined);
+  const selected = normalizeGpt56Models(RAW_MODELS)[0];
+  assert.ok(selected);
+  const model = selected as CodexModel;
+  client.resolveModel = async () => model;
+  const calls: string[] = [];
+  const harness = client as unknown as {
+    request(
+      method: string,
+      params: Record<string, unknown>,
+      timeoutMs: number,
+    ): Promise<unknown>;
+    waitForTurn(): Promise<{ content: string; usage: null }>;
+  };
+  harness.request = async (method) => {
+    calls.push(method);
+    if (method === 'thread/start') {
+      return { thread: { id: 'thread-inject-failure' } };
+    }
+    if (method === 'thread/inject_items') {
+      throw new Error('synthetic history injection failure');
+    }
+    return {};
+  };
+  harness.waitForTurn = async () => {
+    assert.fail('waitForTurn must not start before history injection succeeds');
+  };
+
+  let ready = false;
+  await assert.rejects(
+    client.runText(
+      'Hello',
+      { id: model.id, model: model.model },
+      {
+        historyItems: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Earlier question' }],
+          },
+        ],
+        onReady: () => { ready = true; },
+      },
+    ),
+    /synthetic history injection failure/,
+  );
+  assert.equal(ready, false);
+  assert.deepEqual(calls, ['thread/start', 'thread/inject_items', 'thread/unsubscribe']);
+  assert.equal(calls.includes('turn/start'), false);
 });
 
 function clientConfig(overrides: Partial<AppConfig> = {}): AppConfig {
