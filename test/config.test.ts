@@ -13,6 +13,8 @@ const MANAGED_ENV = [
   'CODEX_TRANSLATOR_PORT',
   'CODEX_BRIDGE_MAX_CONCURRENCY',
   'CODEX_TRANSLATOR_MAX_CONCURRENCY',
+  'CODEX_BRIDGE_REASONING_EFFORT',
+  'CODEX_TRANSLATOR_REASONING_EFFORT',
 ] as const;
 
 test('prefers CODEX_BRIDGE settings and falls back to v0.1 names', () => {
@@ -27,20 +29,24 @@ test('prefers CODEX_BRIDGE settings and falls back to v0.1 names', () => {
     process.env.CODEX_TRANSLATOR_HOME = legacyHome;
     process.env.CODEX_TRANSLATOR_PORT = '9001';
     process.env.CODEX_TRANSLATOR_MAX_CONCURRENCY = '3';
+    process.env.CODEX_TRANSLATOR_REASONING_EFFORT = 'medium';
 
     const legacy = loadConfig();
     assert.equal(legacy.port, 9001);
     assert.equal(legacy.maxConcurrentGenerations, 3);
+    assert.equal(legacy.reasoningEffort, 'medium');
     assert.equal(legacy.dataDirectory, path.join(legacyHome, 'data'));
 
     const canonicalHome = path.join(os.tmpdir(), 'canonical-codex-bridge-home');
     process.env.CODEX_BRIDGE_HOME = canonicalHome;
     process.env.CODEX_BRIDGE_PORT = '9002';
     process.env.CODEX_BRIDGE_MAX_CONCURRENCY = '5';
+    process.env.CODEX_BRIDGE_REASONING_EFFORT = 'none';
 
     const canonical = loadConfig();
     assert.equal(canonical.port, 9002);
     assert.equal(canonical.maxConcurrentGenerations, 5);
+    assert.equal(canonical.reasoningEffort, 'none');
     assert.equal(canonical.dataDirectory, path.join(canonicalHome, 'data'));
   } finally {
     for (const [name, value] of saved) {

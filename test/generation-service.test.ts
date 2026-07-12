@@ -20,7 +20,14 @@ const TEST_MODELS: CodexModel[] = [
     model: 'gpt-5.6-runtime-sol',
     displayName: 'GPT-5.6-Sol',
     isDefault: true,
-    supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
+    supportedReasoningEfforts: [
+      { reasoningEffort: 'low' },
+      { reasoningEffort: 'medium' },
+      { reasoningEffort: 'high' },
+      { reasoningEffort: 'xhigh' },
+      { reasoningEffort: 'max' },
+      { reasoningEffort: 'ultra' },
+    ],
     inputModalities: ['text'],
   },
   {
@@ -28,7 +35,13 @@ const TEST_MODELS: CodexModel[] = [
     model: 'gpt-5.6-runtime-luna',
     displayName: 'GPT-5.6-Luna',
     isDefault: false,
-    supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
+    supportedReasoningEfforts: [
+      { reasoningEffort: 'low' },
+      { reasoningEffort: 'medium' },
+      { reasoningEffort: 'high' },
+      { reasoningEffort: 'xhigh' },
+      { reasoningEffort: 'max' },
+    ],
     inputModalities: ['text'],
   },
 ];
@@ -78,6 +91,7 @@ class GenerationFakeRunner implements StructuredRunner {
     options: TextRunOptions = {},
   ): Promise<{ content: string; usage: null }> {
     this.textCalls.push({ prompt, selection: { ...selection }, options });
+    await options.onReady?.();
     return this.runTextImpl(prompt, selection, options);
   }
 }
@@ -153,6 +167,7 @@ test('sanitizes Chat text content and maps prior roles to App Server history ite
   assert.equal(prepared.input, 'Final question');
   assert.equal(prepared.model.id, 'gpt-5.6-luna');
   assert.equal(prepared.model.model, 'gpt-5.6-runtime-luna');
+  assert.equal(prepared.reasoningEffort, 'low');
   assert.deepEqual(runner.resolvedModels, ['gpt-5.6-luna']);
 });
 
@@ -307,6 +322,7 @@ test('passes selected public/runtime model, actual history, and live deltas to r
       { role: 'user', content: 'Continue' },
     ],
     'gpt-5.6-luna',
+    { effort: 'high' },
   );
   const deltas: string[] = [];
   let completed = false;
@@ -326,6 +342,8 @@ test('passes selected public/runtime model, actual history, and live deltas to r
     model: 'gpt-5.6-runtime-luna',
   });
   assert.deepEqual(runner.textCalls[0]?.options.historyItems, prepared.historyItems);
+  assert.equal(prepared.reasoningEffort, 'high');
+  assert.equal(runner.textCalls[0]?.options.reasoningEffort, 'high');
 
   release.resolve();
   assert.deepEqual(await resultPromise, {
@@ -334,6 +352,55 @@ test('passes selected public/runtime model, actual history, and live deltas to r
     usage: null,
   });
   assert.deepEqual(deltas, ['첫', '째']);
+});
+
+test('normalizes Luna reasoning aliases, applies disabled fallback, and rejects unsupported effort', async () => {
+  const runner = new GenerationFakeRunner();
+  const service = new GenerationService(testConfig(), runner);
+  const messages = [{ role: 'user', content: 'Hello' }];
+
+  const alias = await service.prepareChat(messages, 'gpt-5.6-luna', {
+    effort: 'xhign',
+    thinking: 'enabled',
+  });
+  assert.equal(alias.reasoningEffort, 'xhigh');
+  assert.equal(alias.reasoningFallback, undefined);
+  await service.generate(alias);
+  assert.equal(runner.textCalls.at(-1)?.options.reasoningEffort, 'xhigh');
+
+  const disabled = await service.prepareChat(messages, 'gpt-5.6-luna', {
+    effort: 'high',
+    thinking: 'disabled',
+  });
+  assert.equal(disabled.reasoningEffort, 'low');
+  assert.equal(disabled.reasoningFallback, 'thinking.disabled:none->low');
+  await service.generate(disabled);
+  assert.equal(runner.textCalls.at(-1)?.options.reasoningEffort, 'low');
+
+  const configFallback = await new GenerationService(
+    testConfig({ reasoningEffort: 'none' }),
+    runner,
+  ).prepareResponse('Hello', undefined, 'gpt-5.6-luna');
+  assert.equal(configFallback.reasoningEffort, 'low');
+  assert.equal(configFallback.reasoningFallback, 'none->low');
+
+  await assert.rejects(
+    service.prepareChat(messages, 'gpt-5.6-luna', { effort: 'ultra' }),
+    (error: unknown) =>
+      error instanceof InputError && /ultra.*gpt-5\.6-luna.*supported/i.test(error.message),
+  );
+  await assert.rejects(
+    service.prepareChat(messages, 'gpt-5.6-luna', { effort: 'none' }),
+    (error: unknown) =>
+      error instanceof InputError && /none.*gpt-5\.6-luna.*supported/i.test(error.message),
+  );
+  await assert.rejects(
+    service.prepareChat(messages, 'gpt-5.6-luna', {
+      effort: 'none',
+      thinking: 'enabled',
+    }),
+    (error: unknown) => error instanceof InputError && /cannot be combined/i.test(error.message),
+  );
 });
 
 test('bounds concurrent generations and starts queued work as slots are released', async () => {

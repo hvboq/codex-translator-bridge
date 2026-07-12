@@ -5,10 +5,16 @@ import { tokenMatches } from './auth.js';
 import { ModelUnavailableError, UnsupportedModelError } from './app-server-client.js';
 import {
   GenerationService,
+  normalizeReasoningEffort,
   type PreparedGeneration,
 } from './generation-service.js';
 import { InputError, TranslationService } from './translation-service.js';
-import type { CodexModel, TokenUsage, TranslationRequest } from './types.js';
+import type {
+  CodexModel,
+  RequestedReasoning,
+  TokenUsage,
+  TranslationRequest,
+} from './types.js';
 
 interface StatusProvider {
   getStatus(): Promise<{
@@ -113,8 +119,10 @@ export function createHttpServer(
     if (method === 'POST' && pathname === '/v1/chat/completions') {
       const body = await readObject(request, config.bodyLimitBytes);
       const advisoryParameters = validateChatRequest(body);
-      const prepared = await generations.prepareChat(body.messages, body.model);
+      const reasoning = parseChatReasoning(body);
+      const prepared = await generations.prepareChat(body.messages, body.model, reasoning);
       setAdvisoryParametersHeader(response, advisoryParameters);
+      setReasoningHeaders(response, prepared);
       if (body.stream === true) {
         await streamChatCompletion(request, response, generations, prepared, body);
       } else {
@@ -128,12 +136,15 @@ export function createHttpServer(
     if (method === 'POST' && pathname === '/v1/responses') {
       const body = await readObject(request, config.bodyLimitBytes);
       const advisoryParameters = validateResponsesRequest(body);
+      const reasoning = parseResponsesReasoning(body);
       const prepared = await generations.prepareResponse(
         body.input,
         body.instructions,
         body.model,
+        reasoning,
       );
       setAdvisoryParametersHeader(response, advisoryParameters);
+      setReasoningHeaders(response, prepared);
       if (body.stream === true) {
         await streamResponse(request, response, generations, prepared, body);
       } else {
@@ -148,6 +159,7 @@ export function createHttpServer(
             result.model,
             result.content,
             body,
+            prepared.reasoningEffort,
             'completed',
             result.usage,
           ),
@@ -221,7 +233,6 @@ function validateChatRequest(body: JsonObject): string[] {
     'logit_bias',
     'logprobs',
     'top_logprobs',
-    'reasoning_effort',
     'verbosity',
     'service_tier',
     'prediction',
@@ -299,7 +310,6 @@ function validateResponsesRequest(body: JsonObject): string[] {
     'max_tool_calls',
     'temperature',
     'top_p',
-    'reasoning',
     'service_tier',
   ]);
   if (body.text !== undefined) {
@@ -326,6 +336,58 @@ function validateStream(value: unknown): void {
   if (value !== undefined && typeof value !== 'boolean') {
     throw new InputError('stream must be a boolean');
   }
+}
+
+function parseChatReasoning(body: JsonObject): RequestedReasoning {
+  const effort = normalizeReasoningEffort(body.reasoning_effort, 'reasoning_effort');
+  const thinking = parseThinkingType(body.thinking);
+  return {
+    ...(effort ? { effort } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+function parseResponsesReasoning(body: JsonObject): RequestedReasoning {
+  const value = body.reasoning;
+  if (value === undefined || value === null) {
+    return {};
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InputError('reasoning must be an object or null');
+  }
+  const reasoning = value as JsonObject;
+  const unsupported = Object.keys(reasoning).find(
+    (key) => key !== 'effort' && key !== 'summary',
+  );
+  if (unsupported) {
+    throw new InputError('reasoning.' + unsupported + ' is not supported');
+  }
+  if (reasoning.summary !== undefined && reasoning.summary !== null) {
+    throw new InputError('reasoning.summary is not supported');
+  }
+  const effort = normalizeReasoningEffort(reasoning.effort, 'reasoning.effort');
+  return effort ? { effort } : {};
+}
+
+function parseThinkingType(value: unknown): RequestedReasoning['thinking'] {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InputError('thinking must be an object or null');
+  }
+  const thinking = value as JsonObject;
+  if (Object.keys(thinking).some((key) => key !== 'type')) {
+    throw new InputError('thinking supports only type');
+  }
+  if (typeof thinking.type !== 'string') {
+    throw new InputError('thinking.type must be enabled or disabled');
+  }
+  const type = thinking.type.trim().toLowerCase();
+  if (type !== 'enabled' && type !== 'disabled') {
+    throw new InputError('thinking.type must be enabled or disabled');
+  }
+  return type;
 }
 
 function rejectPresent(body: JsonObject, fields: string[]): void {
@@ -371,6 +433,13 @@ function validateAdvisoryParameters(
 function setAdvisoryParametersHeader(response: ServerResponse, fields: string[]): void {
   if (fields.length > 0) {
     response.setHeader('X-Codex-Bridge-Advisory-Parameters', fields.join(', '));
+  }
+}
+
+function setReasoningHeaders(response: ServerResponse, prepared: PreparedGeneration): void {
+  response.setHeader('X-Codex-Bridge-Reasoning-Effort', prepared.reasoningEffort);
+  if (prepared.reasoningFallback) {
+    response.setHeader('X-Codex-Bridge-Reasoning-Fallback', prepared.reasoningFallback);
   }
 }
 
@@ -505,6 +574,7 @@ async function streamResponse(
             prepared.model.id,
             '',
             requestBody,
+            prepared.reasoningEffort,
             'in_progress',
             null,
           ),
@@ -515,6 +585,7 @@ async function streamResponse(
             prepared.model.id,
             '',
             requestBody,
+            prepared.reasoningEffort,
             'in_progress',
             null,
           ),
@@ -577,6 +648,7 @@ async function streamResponse(
         result.model,
         result.content,
         requestBody,
+        prepared.reasoningEffort,
         'completed',
         result.usage,
       ),
@@ -593,7 +665,13 @@ async function streamResponse(
         param: null,
       });
       event('response.failed', {
-        response: createFailedResponse(ids, prepared.model.id, requestBody, error),
+        response: createFailedResponse(
+          ids,
+          prepared.model.id,
+          requestBody,
+          prepared.reasoningEffort,
+          error,
+        ),
       });
       response.end();
     }
@@ -619,6 +697,7 @@ function createResponseObject(
   model: string,
   content: string,
   requestBody: JsonObject,
+  reasoningEffort: string,
   status: 'in_progress' | 'completed',
   usage: TokenUsage | null,
 ): JsonObject {
@@ -638,7 +717,7 @@ function createResponseObject(
     output_text: completed ? content : '',
     parallel_tool_calls: false,
     previous_response_id: null,
-    reasoning: { effort: null, summary: null },
+    reasoning: { effort: reasoningEffort, summary: null },
     store: false,
     temperature: null,
     text: { format: { type: 'text' } },
@@ -658,10 +737,19 @@ function createFailedResponse(
   ids: ResponseIds,
   model: string,
   requestBody: JsonObject,
+  reasoningEffort: string,
   error: unknown,
 ): JsonObject {
   return {
-    ...createResponseObject(ids, model, '', requestBody, 'in_progress', null),
+    ...createResponseObject(
+      ids,
+      model,
+      '',
+      requestBody,
+      reasoningEffort,
+      'in_progress',
+      null,
+    ),
     status: 'failed',
     completed_at: Math.floor(Date.now() / 1000),
     error: { code: 'codex_bridge_error', message: errorMessage(error) },

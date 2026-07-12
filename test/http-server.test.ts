@@ -17,9 +17,15 @@ import { TranslationService } from '../src/translation-service.js';
 import type { CodexModel, CodexModelSelection } from '../src/types.js';
 
 const HTTP_MODELS: CodexModel[] = [
-  model('gpt-5.6-sol', 'gpt-5.6-sol', true),
-  model('gpt-5.6-terra', 'gpt-5.6-terra'),
-  model('gpt-5.6-luna', 'gpt-5.6-runtime-luna'),
+  model('gpt-5.6-sol', 'gpt-5.6-sol', true, [
+    'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+  ]),
+  model('gpt-5.6-terra', 'gpt-5.6-terra', false, [
+    'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+  ]),
+  model('gpt-5.6-luna', 'gpt-5.6-runtime-luna', false, [
+    'low', 'medium', 'high', 'xhigh', 'max',
+  ]),
   model('gpt-5.5-codex', 'gpt-5.5-codex'),
 ];
 
@@ -30,6 +36,7 @@ class HttpFakeRunner implements StructuredRunner {
     historyItems: Array<Record<string, unknown>>;
     model: string;
     prompt: string;
+    reasoningEffort?: string;
   }> = [];
 
   async listModels(): Promise<CodexModel[]> {
@@ -80,7 +87,9 @@ class HttpFakeRunner implements StructuredRunner {
       historyItems: structuredClone(options.historyItems ?? []),
       model: selection.model,
       prompt,
+      reasoningEffort: options.reasoningEffort,
     });
+    await options.onReady?.();
     if (prompt === 'FAIL') {
       options.onDelta?.('partial');
       throw new Error('synthetic generation failure');
@@ -232,17 +241,19 @@ test('serves general OpenAI-compatible APIs and keeps translate optional', async
 });
 
 test('streams real Chat deltas and typed Responses events in order', async (context) => {
-  const { base } = await startFixture(context);
+  const { base, runner } = await startFixture(context);
 
   const chat = await authorizedFetch(base + '/v1/chat/completions', {
     method: 'POST',
     body: JSON.stringify({
       stream: true,
       stream_options: { include_usage: true },
-      model: 'gpt-5.6-terra',
+      model: 'gpt-5.6-luna',
       max_tokens: 1024,
       temperature: 0,
       top_p: 0.3,
+      reasoning_effort: 'xhign',
+      thinking: { type: 'enabled' },
       messages: [{ role: 'user', content: 'Hello' }],
     }),
   });
@@ -251,6 +262,8 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
     chat.headers.get('x-codex-bridge-advisory-parameters'),
     'max_tokens, temperature, top_p',
   );
+  assert.equal(chat.headers.get('x-codex-bridge-reasoning-effort'), 'xhigh');
+  assert.equal(chat.headers.get('x-codex-bridge-reasoning-fallback'), null);
   const chatFrames = parseDataFrames(await chat.text());
   assert.equal(chatFrames.at(-1), '[DONE]');
   const chatChunks = chatFrames.slice(0, -1).map((frame) => JSON.parse(frame));
@@ -262,6 +275,8 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
   assert.equal(chatChunks.at(-2).choices[0].finish_reason, 'stop');
   assert.deepEqual(chatChunks.at(-1).choices, []);
   assert.equal(chatChunks.at(-1).usage.total_tokens, 15);
+  assert.equal(runner.textCalls.at(-1)?.model, 'gpt-5.6-runtime-luna');
+  assert.equal(runner.textCalls.at(-1)?.reasoningEffort, 'xhigh');
 
   const responses = await authorizedFetch(base + '/v1/responses', {
     method: 'POST',
@@ -269,8 +284,10 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
       stream: true,
       model: 'gpt-5.6-sol',
       input: 'Hello',
+      reasoning: { effort: 'high' },
     }),
   });
+  assert.equal(responses.headers.get('x-codex-bridge-reasoning-effort'), 'high');
   const responseEvents = parseTypedEvents(await responses.text());
   assert.deepEqual(responseEvents.map((entry) => entry.type), [
     'response.created',
@@ -296,6 +313,12 @@ test('streams real Chat deltas and typed Responses events in order', async (cont
     'G:Hello',
   );
   assert.ok(!responseEvents.some((entry) => JSON.stringify(entry.data).includes('[DONE]')));
+  const responseSnapshots = responseEvents
+    .map((entry) => entry.data.response as { reasoning?: { effort?: string } } | undefined)
+    .filter((entry): entry is { reasoning: { effort?: string } } => entry !== undefined);
+  assert.ok(responseSnapshots.length >= 3);
+  assert.ok(responseSnapshots.every((entry) => entry.reasoning.effort === 'high'));
+  assert.equal(runner.textCalls.at(-1)?.reasoningEffort, 'high');
 });
 
 test('accepts validated max token aliases used by OpenAI-compatible clients', async (context) => {
@@ -335,6 +358,124 @@ test('accepts validated max token aliases used by OpenAI-compatible clients', as
   });
   assert.equal(unspecified.status, 200);
   assert.equal(unspecified.headers.get('x-codex-bridge-advisory-parameters'), null);
+});
+
+test('maps Luna thinking controls and echoes the effective Responses effort', async (context) => {
+  const { base, runner } = await startFixture(context);
+
+  const chat = await authorizedFetch(base + '/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      model: 'gpt-5.6-luna',
+      reasoning_effort: 'high',
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: 'Hello' }],
+    }),
+  });
+  assert.equal(chat.status, 200);
+  assert.equal(chat.headers.get('x-codex-bridge-reasoning-effort'), 'low');
+  assert.equal(
+    chat.headers.get('x-codex-bridge-reasoning-fallback'),
+    'thinking.disabled:none->low',
+  );
+  assert.equal(runner.textCalls.at(-1)?.reasoningEffort, 'low');
+
+  const response = await authorizedFetch(base + '/v1/responses', {
+    method: 'POST',
+    body: JSON.stringify({
+      model: 'gpt-5.6-sol',
+      input: 'Hello',
+      reasoning: { effort: 'max', summary: null },
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json() as { reasoning: { effort: string; summary: null } };
+  assert.deepEqual(body.reasoning, { effort: 'max', summary: null });
+  assert.equal(response.headers.get('x-codex-bridge-reasoning-effort'), 'max');
+  assert.equal(runner.textCalls.at(-1)?.reasoningEffort, 'max');
+});
+
+test('rejects invalid and model-specific reasoning controls before SSE starts', async (context) => {
+  const { base, runner } = await startFixture(context);
+  const cases: Array<{ path: string; body: Record<string, unknown> }> = [
+    {
+      path: '/v1/chat/completions',
+      body: { reasoning_effort: 42 },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { reasoning_effort: 'extreme' },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { model: 'gpt-5.6-luna', reasoning_effort: 'none' },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { reasoning_effort: 'none', thinking: { type: 'enabled' } },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { thinking: 'enabled' },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { thinking: {} },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { thinking: { type: 'auto' } },
+    },
+    {
+      path: '/v1/chat/completions',
+      body: { thinking: { type: 'enabled', budget_tokens: 1 } },
+    },
+    {
+      path: '/v1/responses',
+      body: { reasoning: 'high' },
+    },
+    {
+      path: '/v1/responses',
+      body: { reasoning: { effort: 42 } },
+    },
+    {
+      path: '/v1/responses',
+      body: { reasoning: { effort: 'high', summary: 'auto' } },
+    },
+  ];
+  for (const fixture of cases) {
+    const isChat = fixture.path.endsWith('/chat/completions');
+    const response = await authorizedFetch(base + fixture.path, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...fixture.body,
+        ...(isChat
+          ? { messages: [{ role: 'user', content: 'Hello' }] }
+          : { input: 'Hello' }),
+      }),
+    });
+    assert.equal(response.status, 400, JSON.stringify(fixture.body));
+  }
+
+  const callsBefore = runner.textCalls.length;
+  const unsupported = await authorizedFetch(base + '/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      stream: true,
+      model: 'gpt-5.6-luna',
+      max_tokens: 10,
+      reasoning_effort: 'ultra',
+      messages: [{ role: 'user', content: 'Hello' }],
+    }),
+  });
+  assert.equal(unsupported.status, 400);
+  assert.match(unsupported.headers.get('content-type') ?? '', /application\/json/);
+  assert.equal(unsupported.headers.get('x-codex-bridge-advisory-parameters'), null);
+  assert.equal(unsupported.headers.get('x-codex-bridge-reasoning-effort'), null);
+  const error = await unsupported.json() as { error: { message: string; type: string } };
+  assert.equal(error.error.type, 'invalid_request_error');
+  assert.match(error.error.message, /ultra.*gpt-5\.6-luna.*low.*max/i);
+  assert.equal(runner.textCalls.length, callsBefore);
 });
 
 test('rejects unsupported multimodal, tool, stateful, and invalid model requests', async (context) => {
@@ -509,14 +650,19 @@ async function eventually(predicate: () => boolean): Promise<void> {
   assert.fail('Condition was not met before the test deadline');
 }
 
-function model(id: string, runtimeModel: string, isDefault = false): CodexModel {
+function model(
+  id: string,
+  runtimeModel: string,
+  isDefault = false,
+  efforts: string[] = ['low'],
+): CodexModel {
   return {
     id,
     model: runtimeModel,
     displayName: id,
     isDefault,
     defaultReasoningEffort: 'low',
-    supportedReasoningEfforts: [{ reasoningEffort: 'low' }],
+    supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
     inputModalities: ['text'],
   };
 }

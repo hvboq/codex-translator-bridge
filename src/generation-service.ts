@@ -1,12 +1,14 @@
 import type { AppConfig } from './config.js';
-import type {
-  StructuredRunner,
-  TextRunOptions,
+import {
+  ModelUnavailableError,
+  type StructuredRunner,
+  type TextRunOptions,
 } from './app-server-client.js';
 import { InputError } from './translation-service.js';
 import type {
   ChatMessage,
   CodexModel,
+  RequestedReasoning,
   TextGenerationResult,
 } from './types.js';
 
@@ -15,14 +17,24 @@ export interface PreparedGeneration {
   input: string;
   messages: ChatMessage[];
   model: CodexModel;
+  reasoningEffort: string;
+  reasoningFallback?: string;
 }
 
-export interface GenerationRunOptions extends TextRunOptions {
-  onReady?: () => void | Promise<void>;
-}
+export type GenerationRunOptions = TextRunOptions;
 
 const MESSAGE_ROLES = new Set(['system', 'developer', 'user', 'assistant']);
 const TEXT_PART_TYPES = new Set(['text', 'input_text', 'output_text']);
+const REASONING_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]);
 
 export class GenerationService {
   private activeGenerations = 0;
@@ -38,14 +50,19 @@ export class GenerationService {
     private readonly runner: StructuredRunner,
   ) {}
 
-  async prepareChat(messages: unknown, requestedModel?: unknown): Promise<PreparedGeneration> {
-    return this.prepare(normalizeMessages(messages, 'messages'), requestedModel);
+  async prepareChat(
+    messages: unknown,
+    requestedModel?: unknown,
+    reasoning: RequestedReasoning = {},
+  ): Promise<PreparedGeneration> {
+    return this.prepare(normalizeMessages(messages, 'messages'), requestedModel, reasoning);
   }
 
   async prepareResponse(
     input: unknown,
     instructions?: unknown,
     requestedModel?: unknown,
+    reasoning: RequestedReasoning = {},
   ): Promise<PreparedGeneration> {
     const messages = normalizeResponseInput(input);
     if (instructions !== undefined) {
@@ -54,7 +71,7 @@ export class GenerationService {
       }
       messages.unshift({ role: 'developer', content: instructions });
     }
-    return this.prepare(messages, requestedModel);
+    return this.prepare(messages, requestedModel, reasoning);
   }
 
   async generate(
@@ -63,16 +80,19 @@ export class GenerationService {
   ): Promise<TextGenerationResult> {
     await this.acquireGenerationSlot(options.signal);
     try {
-      await options.onReady?.();
       const maxOutputChars = this.config.maxTextChars * 4;
       let streamedChars = 0;
-      const { onReady: _onReady, ...runOptions } = options;
+      const {
+        reasoningEffort: _reasoningEffort,
+        ...runOptions
+      } = options;
       const result = await this.runner.runText(
         prepared.input,
         { id: prepared.model.id, model: prepared.model.model },
         {
           ...runOptions,
           historyItems: prepared.historyItems,
+          reasoningEffort: prepared.reasoningEffort,
           onDelta: (delta) => {
             streamedChars += delta.length;
             if (streamedChars > maxOutputChars) {
@@ -94,6 +114,7 @@ export class GenerationService {
   private async prepare(
     messages: ChatMessage[],
     requestedModelValue?: unknown,
+    reasoning: RequestedReasoning = {},
   ): Promise<PreparedGeneration> {
     const serialized = JSON.stringify(messages);
     if (serialized.length > this.config.maxTextChars * 2) {
@@ -101,6 +122,11 @@ export class GenerationService {
     }
     const requestedModel = normalizeRequestedModel(requestedModelValue);
     const model = await this.runner.resolveModel(requestedModel);
+    const resolvedReasoning = resolveReasoningEffort(
+      model,
+      this.config.reasoningEffort,
+      reasoning,
+    );
     const finalMessage = messages.at(-1);
     if (!finalMessage || finalMessage.role !== 'user' || typeof finalMessage.content !== 'string') {
       throw new InputError('The final message must be a user text message');
@@ -110,6 +136,10 @@ export class GenerationService {
       input: finalMessage.content,
       messages,
       model,
+      reasoningEffort: resolvedReasoning.effort,
+      ...(resolvedReasoning.fallback
+        ? { reasoningFallback: resolvedReasoning.fallback }
+        : {}),
     };
   }
 
@@ -167,6 +197,80 @@ export class GenerationService {
       return;
     }
   }
+}
+
+export function normalizeReasoningEffort(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new InputError(field + ' must be a reasoning effort string or null');
+  }
+  const lowered = value.trim().toLowerCase();
+  const normalized = lowered === 'xhign' ? 'xhigh' : lowered;
+  if (!REASONING_EFFORTS.has(normalized)) {
+    throw new InputError(
+      field + ' must be one of none, minimal, low, medium, high, xhigh, max, or ultra',
+    );
+  }
+  return normalized;
+}
+
+function resolveReasoningEffort(
+  model: CodexModel,
+  configuredEffort: string,
+  reasoning: RequestedReasoning,
+): { effort: string; fallback?: string } {
+  const explicitEffort = normalizeReasoningEffort(reasoning.effort, 'reasoning effort');
+  if (reasoning.thinking === 'enabled' && explicitEffort === 'none') {
+    throw new InputError('thinking.type=enabled cannot be combined with reasoning effort "none"');
+  }
+  const requestControlled = explicitEffort !== undefined || reasoning.thinking === 'disabled';
+  const configured = configuredEffort.toLowerCase();
+  const requestedEffort = reasoning.thinking === 'disabled'
+    ? 'none'
+    : reasoning.thinking === 'enabled' && explicitEffort === undefined && configured === 'none'
+      ? 'minimal'
+      : explicitEffort ?? configured;
+  const supported = model.supportedReasoningEfforts.map((entry) => entry.reasoningEffort);
+  if (supported.length === 0) {
+    return { effort: requestedEffort };
+  }
+  const supportedNames = new Set(supported.map((effort) => effort.toLowerCase()));
+  if (supportedNames.has(requestedEffort)) {
+    return { effort: requestedEffort };
+  }
+  const allowFallback = reasoning.thinking === 'disabled' || explicitEffort === undefined;
+  const fallbackNames = allowFallback
+    ? requestedEffort === 'none'
+      ? ['minimal', 'low']
+      : requestedEffort === 'minimal'
+        ? ['low']
+        : []
+    : [];
+  for (const fallbackName of fallbackNames) {
+    if (supportedNames.has(fallbackName)) {
+      return {
+        effort: fallbackName,
+        fallback:
+          (reasoning.thinking ? 'thinking.' + reasoning.thinking + ':' : '') +
+          requestedEffort +
+          '->' +
+          fallbackName,
+      };
+    }
+  }
+  const message =
+    'Reasoning effort "' +
+    requestedEffort +
+    '" is not supported by ' +
+    model.id +
+    '. Supported values: ' +
+    supported.join(', ');
+  if (requestControlled) {
+    throw new InputError(message);
+  }
+  throw new ModelUnavailableError(message);
 }
 
 function normalizeResponseInput(input: unknown): ChatMessage[] {

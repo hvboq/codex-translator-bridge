@@ -42,6 +42,11 @@ export interface TextGenerationResult {
   usage: TokenUsage | null;
 }
 
+export interface RequestedReasoning {
+  effort?: string;
+  thinking?: 'enabled' | 'disabled';
+}
+
 export interface TokenUsage {
   totalTokens: number;
   inputTokens: number;

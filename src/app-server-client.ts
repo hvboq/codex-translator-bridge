@@ -65,6 +65,8 @@ export interface TextRunResult {
 export interface TextRunOptions {
   historyItems?: Array<Record<string, unknown>>;
   onDelta?: (delta: string) => void;
+  onReady?: () => void | Promise<void>;
+  reasoningEffort?: string;
   signal?: AbortSignal;
 }
 
@@ -190,7 +192,10 @@ export class CodexAppServerClient implements StructuredRunner {
         'Resolved model mapping changed for "' + selection.id + '"; retry the request',
       );
     }
-    assertReasoningEffortSupported(selectedModel, this.config.reasoningEffort);
+    const reasoningEffort = options.reasoningEffort === undefined
+      ? resolveRunReasoningEffort(selectedModel, this.config.reasoningEffort)
+      : options.reasoningEffort;
+    assertReasoningEffortSupported(selectedModel, reasoningEffort);
     if (options.signal?.aborted) {
       throw new Error('Codex generation was cancelled');
     }
@@ -252,6 +257,12 @@ export class CodexAppServerClient implements StructuredRunner {
         throw error;
       }
     }
+    try {
+      await options.onReady?.();
+    } catch (error) {
+      void this.request('thread/unsubscribe', { threadId }, 5_000).catch(() => undefined);
+      throw error;
+    }
     const result = this.waitForTurn(threadId, options);
     void result.catch(() => undefined);
 
@@ -262,7 +273,7 @@ export class CodexAppServerClient implements StructuredRunner {
       const turnParams: Record<string, unknown> = {
         threadId,
         input: [{ type: 'text', text: prompt }],
-        effort: this.config.reasoningEffort,
+        effort: reasoningEffort,
         approvalPolicy: 'never',
         sandboxPolicy: {
           type: 'readOnly',
@@ -551,7 +562,7 @@ export class CodexAppServerClient implements StructuredRunner {
       if (
         item &&
         ['agentMessage', 'agent_message'].includes(item.type ?? '') &&
-        item.phase !== 'commentary' &&
+        item.phase === 'final_answer' &&
         typeof item.text === 'string'
       ) {
         this.turns.get(threadId)?.messages.push(item.text);
@@ -586,7 +597,7 @@ export class CodexAppServerClient implements StructuredRunner {
         ?.filter(
           (item) =>
             ['agentMessage', 'agent_message'].includes(item.type ?? '') &&
-            item.phase !== 'commentary',
+            item.phase === 'final_answer',
         )
         .map((item) => item.text)
         .filter((text): text is string => typeof text === 'string');
@@ -804,6 +815,28 @@ export function assertReasoningEffortSupported(model: CodexModel, effort: string
         '. Supported values: ' +
         supported.join(', '),
     );
+  }
+}
+
+function resolveRunReasoningEffort(model: CodexModel, effort: string): string {
+  try {
+    assertReasoningEffortSupported(model, effort);
+    return effort;
+  } catch (error) {
+    const normalized = effort.toLowerCase();
+    const fallbackNames = normalized === 'none'
+      ? ['minimal', 'low']
+      : normalized === 'minimal'
+        ? ['low']
+        : [];
+    const supported = new Set(
+      model.supportedReasoningEfforts.map((entry) => entry.reasoningEffort.toLowerCase()),
+    );
+    const fallback = fallbackNames.find((candidate) => supported.has(candidate));
+    if (fallback) {
+      return fallback;
+    }
+    throw error;
   }
 }
 
