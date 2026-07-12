@@ -1,0 +1,43 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck, test, and build
+        run: npm run check
+
+      - name: Build Windows portable package
+        shell: pwsh
+        run: ./scripts/build-release.ps1 -Version $env:GITHUB_REF_NAME
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem -LiteralPath "dist/release" -File | Where-Object { $_.Extension -in @(".zip", ".sha256") } | ForEach-Object { $_.FullName })
+          if ($assets.Count -ne 2) { throw "Expected a ZIP and SHA-256 file, found $($assets.Count)." }
+          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --generate-notes --title "Codex Translator Bridge $env:GITHUB_REF_NAME"

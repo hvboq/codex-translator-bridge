@@ -15,6 +15,7 @@
     "codex:login": "codex login",
     "codex:status": "codex login status",
     "check": "npm run typecheck && npm test && npm run build",
+    "release:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1",
     "test": "node --import tsx --test test/**/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
