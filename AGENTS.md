@@ -23,6 +23,8 @@ Key files:
 - src/prompt.ts: translation-only instructions and structured-output schemas.
 - src/placeholders.ts: game token, markup, and control-code protection.
 - src/cache.ts: bounded in-memory cache plus optional JSONL persistence.
+- packaging/windows/: non-developer-facing Windows portable launchers and first-run guide.
+- scripts/build-release.ps1: reproducible Windows x64 ZIP builder with Node checksum verification.
 - test/: offline unit and HTTP tests using fake structured runners.
 
 ## Standard commands
@@ -36,6 +38,7 @@ npm.cmd run codex:login
 npm.cmd run typecheck
 npm.cmd test
 npm.cmd run build
+npm.cmd run release:windows
 ~~~
 
 Development and manual verification:
@@ -99,6 +102,7 @@ The App Server process is long-lived, but every translation batch uses a new eph
 - Keep @openai/codex pinned to an exact version unless an upgrade is deliberately tested.
 - Update README.md and config.example.ps1 when endpoints, setup, defaults, or environment variables change.
 - Keep repository-authored code and documentation under the root MIT License. Do not vendor third-party code without preserving its original license and documenting it in THIRD_PARTY_NOTICES.md.
+- Portable releases must contain no credentials or cache data, must verify the downloaded Node.js archive checksum, and must include third-party license texts.
 - Keep commits focused and use clear imperative subjects.
 - Before committing, run npm.cmd run check and git diff --check.
 - For App Server, authentication, or startup changes, also run a live health/translation smoke test when credentials and network are available.

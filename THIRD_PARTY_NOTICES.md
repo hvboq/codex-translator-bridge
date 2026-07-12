@@ -12,3 +12,5 @@ Installing dependencies with `npm ci` downloads third-party packages that remain
 | `typescript` | TypeScript compiler | Apache-2.0 |
 
 See each installed package and `package-lock.json` for exact versions and transitive dependency information.
+
+The Windows portable release also bundles the matching official Node.js x64 runtime and the platform-specific Codex executable. Their full license texts are included in the release under `licenses/`.
