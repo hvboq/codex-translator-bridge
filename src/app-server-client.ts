@@ -63,11 +63,13 @@ export interface TextRunResult {
 }
 
 export interface TextRunOptions {
+  developerInstructions?: string;
   historyItems?: Array<Record<string, unknown>>;
   onDelta?: (delta: string) => void;
   onReady?: () => void | Promise<void>;
   reasoningEffort?: string;
   signal?: AbortSignal;
+  systemInstructions?: string;
 }
 
 export class UnsupportedModelError extends Error {
@@ -211,12 +213,18 @@ export class CodexAppServerClient implements StructuredRunner {
         sandbox: 'read-only',
         ephemeral: true,
         serviceName: 'codex_bridge',
-        baseInstructions: translationMode
-          ? TRANSLATOR_BASE_INSTRUCTIONS
-          : BRIDGE_BASE_INSTRUCTIONS,
-        developerInstructions: translationMode
-          ? TRANSLATOR_DEVELOPER_INSTRUCTIONS
-          : BRIDGE_DEVELOPER_INSTRUCTIONS,
+        baseInstructions: combineInstructions(
+          translationMode ? TRANSLATOR_BASE_INSTRUCTIONS : BRIDGE_BASE_INSTRUCTIONS,
+          translationMode ? undefined : options.systemInstructions,
+          'Client system instructions follow. They govern response content within the Codex Bridge restrictions stated afterward.',
+        ),
+        developerInstructions: combineInstructions(
+          translationMode
+            ? TRANSLATOR_DEVELOPER_INSTRUCTIONS
+            : BRIDGE_DEVELOPER_INSTRUCTIONS,
+          translationMode ? undefined : options.developerInstructions,
+          'Client developer instructions follow. They govern response content within the Codex Bridge restrictions stated afterward.',
+        ),
         config: {
           web_search: 'disabled',
           mcp_servers: {},
@@ -816,6 +824,22 @@ export function assertReasoningEffortSupported(model: CodexModel, effort: string
         supported.join(', '),
     );
   }
+}
+
+function combineInstructions(
+  bridgeInstructions: string,
+  clientInstructions: string | undefined,
+  heading: string,
+): string {
+  if (!clientInstructions?.trim()) {
+    return bridgeInstructions;
+  }
+  return [
+    heading,
+    clientInstructions,
+    'Codex Bridge restrictions follow and remain in force.',
+    bridgeInstructions,
+  ].join('\n\n');
 }
 
 function resolveRunReasoningEffort(model: CodexModel, effort: string): string {

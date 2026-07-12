@@ -96,7 +96,7 @@ class GenerationFakeRunner implements StructuredRunner {
   }
 }
 
-test('sanitizes Chat text content and maps prior roles to App Server history items', async () => {
+test('separates Chat instructions from sanitized App Server history items', async () => {
   const runner = new GenerationFakeRunner();
   const service = new GenerationService(testConfig(), runner);
 
@@ -123,6 +123,8 @@ test('sanitizes Chat text content and maps prior roles to App Server history ite
         role: 'assistant',
         content: [{ type: 'output_text', text: 'Earlier answer' }],
       },
+      { role: 'system', content: 'Later system rules' },
+      { role: 'developer', content: 'Later developer rules' },
       {
         role: 'user',
         content: [
@@ -140,19 +142,16 @@ test('sanitizes Chat text content and maps prior roles to App Server history ite
     { role: 'developer', content: 'Developer rules' },
     { role: 'user', content: 'Earlier question' },
     { role: 'assistant', content: 'Earlier answer' },
+    { role: 'system', content: 'Later system rules' },
+    { role: 'developer', content: 'Later developer rules' },
     { role: 'user', content: 'Final question' },
   ]);
+  assert.equal(prepared.systemInstructions, 'System rules\n\nLater system rules');
+  assert.equal(
+    prepared.developerInstructions,
+    'Developer rules\n\nLater developer rules',
+  );
   assert.deepEqual(prepared.historyItems, [
-    {
-      type: 'message',
-      role: 'system',
-      content: [{ type: 'input_text', text: 'System rules' }],
-    },
-    {
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: 'Developer rules' }],
-    },
     {
       type: 'message',
       role: 'user',
@@ -171,7 +170,7 @@ test('sanitizes Chat text content and maps prior roles to App Server history ite
   assert.deepEqual(runner.resolvedModels, ['gpt-5.6-luna']);
 });
 
-test('sanitizes Responses text input and prepends instructions to actual history', async () => {
+test('separates Responses instructions from sanitized App Server history', async () => {
   const runner = new GenerationFakeRunner();
   const service = new GenerationService(testConfig(), runner);
 
@@ -185,9 +184,19 @@ test('sanitizes Responses text input and prepends instructions to actual history
       },
       {
         type: 'message',
+        role: 'developer',
+        content: 'Nested developer instructions',
+      },
+      {
+        type: 'message',
         role: 'assistant',
         content: [{ type: 'output_text', text: 'Previous answer' }],
         status: 'completed',
+      },
+      {
+        type: 'message',
+        role: 'system',
+        content: 'Later system context',
       },
       {
         type: 'message',
@@ -205,20 +214,17 @@ test('sanitizes Responses text input and prepends instructions to actual history
   assert.deepEqual(prepared.messages, [
     { role: 'developer', content: 'Follow these developer instructions' },
     { role: 'system', content: 'System context' },
+    { role: 'developer', content: 'Nested developer instructions' },
     { role: 'assistant', content: 'Previous answer' },
+    { role: 'system', content: 'Later system context' },
     { role: 'user', content: 'Next question' },
   ]);
+  assert.equal(prepared.systemInstructions, 'System context\n\nLater system context');
+  assert.equal(
+    prepared.developerInstructions,
+    'Follow these developer instructions\n\nNested developer instructions',
+  );
   assert.deepEqual(prepared.historyItems, [
-    {
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: 'Follow these developer instructions' }],
-    },
-    {
-      type: 'message',
-      role: 'system',
-      content: [{ type: 'input_text', text: 'System context' }],
-    },
     {
       type: 'message',
       role: 'assistant',
@@ -231,6 +237,8 @@ test('sanitizes Responses text input and prepends instructions to actual history
   const simple = await service.prepareResponse('Plain string input');
   assert.deepEqual(simple.messages, [{ role: 'user', content: 'Plain string input' }]);
   assert.deepEqual(simple.historyItems, []);
+  assert.equal(simple.systemInstructions, undefined);
+  assert.equal(simple.developerInstructions, undefined);
   assert.equal(simple.input, 'Plain string input');
 });
 
@@ -318,6 +326,7 @@ test('passes selected public/runtime model, actual history, and live deltas to r
   const prepared = await service.prepareChat(
     [
       { role: 'system', content: 'Be concise' },
+      { role: 'developer', content: 'Keep the requested format' },
       { role: 'assistant', content: 'Previous answer' },
       { role: 'user', content: 'Continue' },
     ],
@@ -327,7 +336,11 @@ test('passes selected public/runtime model, actual history, and live deltas to r
   const deltas: string[] = [];
   let completed = false;
   const resultPromise = service
-    .generate(prepared, { onDelta: (delta) => deltas.push(delta) })
+    .generate(prepared, {
+      developerInstructions: 'Caller override must be ignored',
+      onDelta: (delta) => deltas.push(delta),
+      systemInstructions: 'Caller override must be ignored',
+    })
     .finally(() => {
       completed = true;
     });
@@ -342,6 +355,11 @@ test('passes selected public/runtime model, actual history, and live deltas to r
     model: 'gpt-5.6-runtime-luna',
   });
   assert.deepEqual(runner.textCalls[0]?.options.historyItems, prepared.historyItems);
+  assert.equal(runner.textCalls[0]?.options.systemInstructions, 'Be concise');
+  assert.equal(
+    runner.textCalls[0]?.options.developerInstructions,
+    'Keep the requested format',
+  );
   assert.equal(prepared.reasoningEffort, 'high');
   assert.equal(runner.textCalls[0]?.options.reasoningEffort, 'high');
 
