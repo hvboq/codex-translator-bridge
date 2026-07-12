@@ -58,6 +58,7 @@ npm.cmd run dev
 - `codex-bridge` is the canonical unlisted default alias. Keep `codex-translator` as a v0.1 compatibility alias.
 - Chat and Responses are text-only compatibility subsets. Reject unsupported image, audio, file, tool, function, stateful, background, or stored-response behavior instead of silently ignoring it.
 - Validate and accept Chat `max_tokens`, `max_completion_tokens`, `temperature`, and `top_p`, plus Responses `max_output_tokens`, as explicitly documented advisory compatibility parameters. List present non-null fields in `X-Codex-Bridge-Advisory-Parameters`; treat explicit `null` as unspecified, and do not claim or imply hard enforcement until App Server exposes it.
+- Normalize and pass Chat `reasoning_effort` and Responses `reasoning.effort` to App Server `turn/start.effort`; validate against the selected model before SSE starts. Support Luna `thinking.type` (`enabled`/`disabled`) and its `xhign` typo. Lowest-effort fallback is only for `thinking.type=disabled` and configured defaults; reject unsupported explicit standard effort values. Expose the effective value without streaming reasoning content.
 - Chat streaming uses incremental `chat.completion.chunk` frames and `[DONE]`.
 - Responses streaming uses typed events ending in `response.completed`, without `[DONE]`.
 - Stream only `agentMessage` items whose phase is `final_answer`; never expose commentary, reasoning, plans, or tool events.

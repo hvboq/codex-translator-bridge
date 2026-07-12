@@ -35,6 +35,16 @@ test('streams only final-answer deltas and ignores retrying errors', async () =>
     willRetry: true,
     error: { message: 'temporary failure' },
   });
+  internals.handleNotification('item/completed', {
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    item: {
+      type: 'agentMessage',
+      id: 'reasoning-1',
+      phase: 'reasoning',
+      text: 'private reasoning',
+    },
+  });
   internals.handleNotification('item/started', {
     threadId: 'thread-1',
     turnId: 'turn-1',
@@ -86,6 +96,18 @@ test('streams only final-answer deltas and ignores retrying errors', async () =>
           id: 'commentary-1',
           phase: 'commentary',
           text: 'private commentary',
+        },
+        {
+          type: 'agentMessage',
+          id: 'plan-1',
+          phase: 'plan',
+          text: 'private plan',
+        },
+        {
+          type: 'agentMessage',
+          id: 'reasoning-1',
+          phase: 'reasoning',
+          text: 'private reasoning',
         },
         {
           type: 'agentMessage',

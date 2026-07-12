@@ -9,7 +9,7 @@ export interface AppConfig {
   tokenFile: string;
   noAuth: boolean;
   model?: string;
-  reasoningEffort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  reasoningEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   requestTimeoutMs: number;
   bodyLimitBytes: number;
   maxTextChars: number;
@@ -56,7 +56,7 @@ function effortEnv(): AppConfig['reasoningEffort'] {
   const value = (
     envValue('CODEX_BRIDGE_REASONING_EFFORT', 'CODEX_TRANSLATOR_REASONING_EFFORT') ?? 'low'
   ).toLowerCase();
-  if (!['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(value)) {
+  if (!['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(value)) {
     throw new Error('CODEX_BRIDGE_REASONING_EFFORT is invalid');
   }
   return value as AppConfig['reasoningEffort'];

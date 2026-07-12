@@ -7,6 +7,8 @@
 # Use "codex-bridge" to select the current GPT-5.6 default explicitly.
 # To pin a model, use an exact gpt-5.6-* ID returned by GET /v1/models.
 # $env:CODEX_BRIDGE_MODEL = "codex-bridge"
+# Per-request reasoning_effort / reasoning.effort overrides this default.
+# none or minimal falls back to the model's lowest advertised effort when needed.
 # $env:CODEX_BRIDGE_REASONING_EFFORT = "low" # Must be supported by the selected model.
 # $env:CODEX_BRIDGE_TIMEOUT_MS = "90000"
 # $env:CODEX_BRIDGE_BODY_LIMIT = "1048576"

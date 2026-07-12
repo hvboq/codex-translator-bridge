@@ -2,12 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   assertReasoningEffortSupported,
+  CodexAppServerClient,
   collectGpt56ModelCatalog,
   ModelUnavailableError,
   normalizeGpt56Models,
   resolveGpt56Model,
   UnsupportedModelError,
 } from '../src/app-server-client.js';
+import type { AppConfig } from '../src/config.js';
+import type { CodexModel } from '../src/types.js';
 
 const RAW_MODELS = [
   {
@@ -170,3 +173,103 @@ test('checks configured reasoning effort against the selected model catalog entr
     ModelUnavailableError,
   );
 });
+
+test('passes request reasoning effort to turn/start and revalidates the live catalog', async () => {
+  const client = new CodexAppServerClient(
+    clientConfig({ reasoningEffort: 'none' }),
+    () => undefined,
+  );
+  const selected = normalizeGpt56Models(RAW_MODELS)[0];
+  assert.ok(selected);
+  const model = selected as CodexModel;
+  client.resolveModel = async () => model;
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const harness = client as unknown as {
+    request(
+      method: string,
+      params: Record<string, unknown>,
+      timeoutMs: number,
+    ): Promise<unknown>;
+    waitForTurn(): Promise<{ content: string; usage: null }>;
+  };
+  harness.request = async (method, params) => {
+    calls.push({ method, params });
+    return method === 'thread/start' ? { thread: { id: 'thread-test' } } : {};
+  };
+  harness.waitForTurn = async () => ({ content: 'OK', usage: null });
+
+  let ready = false;
+  const result = await client.runText(
+    'Hello',
+    { id: model.id, model: model.model },
+    { reasoningEffort: 'high', onReady: () => { ready = true; } },
+  );
+  assert.deepEqual(result, { content: 'OK', usage: null });
+  assert.equal(ready, true);
+  const turnStart = calls.find((call) => call.method === 'turn/start');
+  assert.equal(turnStart?.params.effort, 'high');
+  assert.equal(
+    calls.find((call) => call.method === 'thread/start')?.params.effort,
+    undefined,
+  );
+
+  calls.length = 0;
+  await client.runText(
+    'Hello',
+    { id: model.id, model: model.model },
+    {},
+  );
+  assert.equal(
+    calls.find((call) => call.method === 'turn/start')?.params.effort,
+    'low',
+  );
+
+  calls.length = 0;
+  ready = false;
+  await assert.rejects(
+    client.runText(
+      'Hello',
+      { id: model.id, model: model.model },
+      { reasoningEffort: 'none', onReady: () => { ready = true; } },
+    ),
+    ModelUnavailableError,
+  );
+  assert.equal(calls.length, 0);
+  assert.equal(ready, false);
+
+  calls.length = 0;
+  await assert.rejects(
+    client.runText(
+      'Hello',
+      { id: model.id, model: model.model },
+      { reasoningEffort: 'ultra', onReady: () => { ready = true; } },
+    ),
+    ModelUnavailableError,
+  );
+  assert.equal(calls.length, 0);
+  assert.equal(ready, false);
+});
+
+function clientConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+  return {
+    host: '127.0.0.1',
+    port: 0,
+    dataDirectory: process.cwd(),
+    runtimeDirectory: process.cwd(),
+    cacheFile: 'cache.jsonl',
+    tokenFile: 'token.txt',
+    noAuth: false,
+    reasoningEffort: 'low',
+    requestTimeoutMs: 10_000,
+    bodyLimitBytes: 100_000,
+    maxTextChars: 10_000,
+    maxBatchItems: 8,
+    maxConcurrentGenerations: 2,
+    batchWindowMs: 1,
+    cacheMaxEntries: 100,
+    cachePersistent: false,
+    defaultSource: 'auto',
+    defaultTarget: 'ko',
+    ...overrides,
+  };
+}

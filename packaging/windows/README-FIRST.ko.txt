@@ -45,6 +45,8 @@ LunaTranslator
 LunaTranslator의 대형 모델 범용 인터페이스에도 같은 주소와 키를 사용할 수 있습니다.
 Luna가 기본 전송하는 max_tokens, temperature, top_p는 호환용 값으로 수용됩니다.
 단, Codex App Server가 하드 토큰 제한을 받지 않아 max_tokens는 실제 제한을 보장하지 않습니다.
+reasoning_effort와 thinking.type도 지원하며 실제 적용 강도는 응답 헤더에 표시됩니다.
+thinking.type=disabled를 모델이 완전히 지원하지 않으면 지원되는 최저 강도로 대체됩니다.
 번역 캐시와 placeholder 보호가 꼭 필요하면 /translate 경로 또는 전용 연동을 권장합니다.
 
 종료와 다시 실행
